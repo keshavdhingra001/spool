@@ -163,10 +163,15 @@ async fn backpressure_does_not_deadlock() {
     )
     .await
     .unwrap();
-    let c = Client::connect(server.local_addr()).await.unwrap();
+    // Eight connections, so more requests wait for the core than one
+    // connection's in-flight cap allows.
+    let mut clients = Vec::new();
+    for _ in 0..8 {
+        clients.push(Client::connect(server.local_addr()).await.unwrap());
+    }
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..2_000 {
-        let c = c.clone();
+        let c = clients[i % clients.len()].clone();
         // Large payloads, so socket buffers fill on both sides as well.
         tasks.spawn(async move {
             c.enqueue(&q("a"), Payload(vec![i as u8; 4_000]), Millis(0), None)
@@ -176,7 +181,7 @@ async fn backpressure_does_not_deadlock() {
     }
     let done = tokio::time::timeout(Duration::from_secs(60), tasks.join_all()).await;
     assert_eq!(done.expect("no deadlock").len(), 2_000);
-    drop(c);
+    drop(clients);
     let stopped = server.shutdown().await;
     stopped.result.unwrap();
     assert!(stopped.stats.largest_batch <= 2, "{:?}", stopped.stats);

@@ -358,7 +358,11 @@ independent checkers (D19) over scenario files (D20) and random command sequence
 - **Alternatives:** real files and `kill -9` only; a fault-injection crate (`failpoints`).
 - **Why:** killing a real process only tests the crash points the timing happens to hit. The seam
   makes every point reachable and every run repeatable, and it is the disk the M5 simulator will
-  plug in. Its model is stated, not hidden: it does not produce garbage other than zeros inside
+  plug in. Run: three generated workloads of 40 commands (snapshot every 6) and the 9 scenario
+  files back to back (snapshot every 25), single commands and batches mixed: 562 failure points,
+  33,667 crash images, 136,725 second crashes inside recovery, about 11 s in a debug build. The
+  harness asserts it reached unacknowledged commands that survived, unsynced commands that were
+  lost, torn tails and recovery from a snapshot. Its model is stated, not hidden: it does not produce garbage other than zeros inside
   unsynced data, or reorder writes within a file; the CRC covers the first and M5 can add the second.
 
 ### D29: Recovery and directory layout

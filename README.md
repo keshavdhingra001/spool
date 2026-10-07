@@ -4,10 +4,12 @@ A distributed task queue in Rust, built from the bottom up: its own broker and s
 Postgres underneath), leases with visibility timeouts and fencing tokens, effectively-once
 processing, Raft replication written from scratch, and partition testing by deterministic simulation.
 
-**Status:** M1. A single-node, in-memory reference queue: leases with visibility timeouts and fencing
-tokens, heartbeats, ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state
-with redrive. Checked after every command by an invariant checker and an independent event ledger, over
-scenario files and random command sequences. Durability (M2) and networking (M3) come next.
+**Status:** M2. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
+ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state with redrive
+(M1), now durable (M2): every command goes into a checksummed write-ahead log and is synced before
+its result is returned, with periodic snapshots and recovery that is tested by failing at every
+storage call and recovering every state a crash could leave on disk, including a second crash during
+recovery. Networking (M3) comes next.
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
 ## Design in one paragraph
@@ -38,6 +40,20 @@ leased job=1 token=2 deadline=60 attempt=2 payload=charge-card
 rejected reason=stale_token
 > @50 ack 1 2
 acked job=1
+```
+
+Durable mode keeps the queue in a directory and recovers it on the next start (D21–D29):
+
+```
+cargo run -- --data /tmp/q
+> @0 enqueue q charge-card
+enqueued job=1 queue=q ready_at=0
+> quit
+cargo run -- --data /tmp/q
+spool queue in /tmp/q: snapshot at LSN 0, 1 commands replayed, 0 torn bytes cut. Type `help`.
+> jobs
+now=0 waiting=1 leased=0 dead=0 acked=0
+  job=1 queue=q attempts=0 waiting ready_at=0
 ```
 
 Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a

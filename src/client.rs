@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::command::{Event, Op, RejectReason};
+use crate::command::{Event, Op, RejectReason, ResultStatus};
 use crate::protocol::{self, Reply, Request};
 use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Token};
 
@@ -248,6 +248,28 @@ impl Client {
     pub async fn ack(&self, job: JobId, token: Token) -> Result<(), ClientError> {
         match self.outcome(Op::Ack { job, token }).await? {
             Event::Acked { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Finish the job with `result`: ack and store the result in one command
+    /// (D41). Safe to repeat with the same token if the reply was lost (D42).
+    pub async fn complete(
+        &self,
+        job: JobId,
+        token: Token,
+        result: Payload,
+    ) -> Result<(), ClientError> {
+        match self.outcome(Op::Complete { job, token, result }).await? {
+            Event::Completed { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Whether `job` is still queued, finished with a result, or neither (D41).
+    pub async fn result(&self, job: JobId) -> Result<ResultStatus, ClientError> {
+        match self.outcome(Op::Result { job }).await? {
+            Event::Result { status, .. } => Ok(status),
             other => Err(unexpected(other)),
         }
     }

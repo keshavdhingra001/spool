@@ -1,6 +1,6 @@
-//! The worker loop (D34, D36): lease, run the handler while heartbeating,
-//! ack on success, nack on failure, and drop the handler when the lease is
-//! lost.
+//! The worker loop (D34, D36, D44): lease, run the handler while
+//! heartbeating, ack or complete on success, nack on failure, and drop the
+//! handler when the lease is lost.
 
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
@@ -8,7 +8,27 @@ use std::time::Duration;
 
 use crate::client::{Client, ClientError, Leased};
 use crate::command::RejectReason;
-use crate::types::{JobId, Millis, QueueName};
+use crate::types::{JobId, Millis, Payload, QueueName};
+
+/// How a handler's success is reported (D44): `()` acks, a `Payload`
+/// completes the job with that result (D41).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Completion {
+    Ack,
+    Result(Payload),
+}
+
+impl From<()> for Completion {
+    fn from((): ()) -> Self {
+        Completion::Ack
+    }
+}
+
+impl From<Payload> for Completion {
+    fn from(p: Payload) -> Self {
+        Completion::Result(p)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerOptions {
@@ -36,6 +56,8 @@ pub enum Outcome {
     Idle,
     /// The handler succeeded and the ack was accepted.
     Acked(JobId),
+    /// The handler succeeded with a result and the complete was accepted.
+    Completed(JobId),
     /// The handler failed and the job was given back.
     Nacked(JobId),
     /// The lease was lost while the handler ran (its heartbeat was rejected,
@@ -47,6 +69,8 @@ pub struct Worker {
     client: Client,
     queue: QueueName,
     options: WorkerOptions,
+    /// Where to reconnect if a complete's reply is lost (D44).
+    addr: Option<String>,
 }
 
 impl Worker {
@@ -55,15 +79,32 @@ impl Worker {
             client,
             queue,
             options,
+            addr: None,
         }
+    }
+
+    /// Connect to `addr`; if a complete's reply is lost later, reconnect there
+    /// and retry it once (D42).
+    pub async fn connect(
+        addr: &str,
+        queue: QueueName,
+        options: WorkerOptions,
+    ) -> Result<Self, ClientError> {
+        Ok(Worker {
+            client: Client::connect(addr).await?,
+            queue,
+            options,
+            addr: Some(addr.to_string()),
+        })
     }
 
     /// Process jobs until a call to the server fails. Stop it by dropping or
     /// aborting the task that runs it.
-    pub async fn run<F, Fut, E>(&self, mut handler: F) -> Result<(), ClientError>
+    pub async fn run<F, Fut, T, E>(&mut self, mut handler: F) -> Result<(), ClientError>
     where
         F: FnMut(Leased) -> Fut,
-        Fut: Future<Output = Result<(), E>>,
+        Fut: Future<Output = Result<T, E>>,
+        T: Into<Completion>,
     {
         let mut idle = self.options.idle_min;
         let seed = RandomState::new();
@@ -86,10 +127,11 @@ impl Worker {
     }
 
     /// One turn: lease a job and see it through, or report the queue empty.
-    pub async fn step<F, Fut, E>(&self, handler: &mut F) -> Result<Outcome, ClientError>
+    pub async fn step<F, Fut, T, E>(&mut self, handler: &mut F) -> Result<Outcome, ClientError>
     where
         F: FnMut(Leased) -> Fut,
-        Fut: Future<Output = Result<(), E>>,
+        Fut: Future<Output = Result<T, E>>,
+        T: Into<Completion>,
     {
         let visibility = self.options.visibility;
         let Some(job) = self.client.lease(&self.queue, visibility).await? else {
@@ -115,15 +157,42 @@ impl Worker {
                 }
             }
         };
-        let done = match result {
-            Ok(()) => self.client.ack(lease.job, lease.token).await,
-            Err(_) => self.client.nack(lease.job, lease.token).await,
+        let (done, outcome) = match result.map(Into::into) {
+            Ok(Completion::Ack) => (
+                self.client.ack(lease.job, lease.token).await,
+                Outcome::Acked(lease.job),
+            ),
+            Ok(Completion::Result(payload)) => (
+                self.complete(lease.job, lease.token, payload).await,
+                Outcome::Completed(lease.job),
+            ),
+            Err(_) => (
+                self.client.nack(lease.job, lease.token).await,
+                Outcome::Nacked(lease.job),
+            ),
         };
         match done {
-            Ok(()) if result.is_ok() => Ok(Outcome::Acked(lease.job)),
-            Ok(()) => Ok(Outcome::Nacked(lease.job)),
+            Ok(()) => Ok(outcome),
             Err(ClientError::Rejected(reason)) => Ok(Outcome::Lost(lease.job, reason)),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Complete, and if the connection dies before the reply, reconnect and
+    /// send the same complete again: it lands at most once either way (D42).
+    async fn complete(
+        &mut self,
+        job: JobId,
+        token: crate::types::Token,
+        payload: Payload,
+    ) -> Result<(), ClientError> {
+        match self.client.complete(job, token, payload.clone()).await {
+            Err(ClientError::Closed | ClientError::Io(_)) if self.addr.is_some() => {
+                let addr = self.addr.as_deref().expect("checked");
+                self.client = Client::connect(addr).await?;
+                self.client.complete(job, token, payload).await
+            }
+            other => other,
         }
     }
 }

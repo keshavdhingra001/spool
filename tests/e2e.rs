@@ -247,7 +247,7 @@ async fn concurrent_workers_process_every_job_once() {
         };
         let (seen, all_done) = (seen.clone(), all_done.clone());
         workers.spawn(async move {
-            let worker = Worker::new(client, q("work"), WorkerOptions::default());
+            let mut worker = Worker::new(client, q("work"), WorkerOptions::default());
             worker
                 .run(|job| {
                     let (seen, all_done) = (seen.clone(), all_done.clone());
@@ -331,7 +331,7 @@ async fn a_lost_lease_stops_the_handler() {
     }
     let dropped = Arc::new(Mutex::new(false));
     let started = Arc::new(Notify::new());
-    let worker = Worker::new(
+    let mut worker = Worker::new(
         c,
         q("a"),
         WorkerOptions {
@@ -448,4 +448,113 @@ async fn a_reply_with_the_wrong_id_is_a_protocol_error() {
     // The connection is unusable afterwards; later calls fail at once.
     let later = tokio::time::timeout(Duration::from_secs(5), c.request(Op::Tick)).await;
     assert!(matches!(later, Ok(Err(_))), "{later:?}");
+}
+
+#[tokio::test]
+async fn a_worker_completes_with_a_result() {
+    let clock = ManualClock::new(0);
+    let server = start(&clock).await;
+    let c = Client::connect(server.local_addr()).await.unwrap();
+    let job = c
+        .enqueue(&q("a"), p("21"), Millis(0), None)
+        .await
+        .unwrap()
+        .job;
+    assert_eq!(c.result(job).await.unwrap(), spool::ResultStatus::Pending);
+    let mut worker = Worker::new(c.clone(), q("a"), WorkerOptions::default());
+    let mut double = |job: spool::client::Leased| async move {
+        let n: u32 = String::from_utf8(job.payload.0).unwrap().parse().unwrap();
+        Ok::<_, ()>(Payload((n * 2).to_string().into_bytes()))
+    };
+    assert_eq!(
+        worker.step(&mut double).await.unwrap(),
+        Outcome::Completed(job)
+    );
+    assert_eq!(
+        c.result(job).await.unwrap(),
+        spool::ResultStatus::Done {
+            token: spool::Token(1),
+            payload: p("42")
+        }
+    );
+    drop((c, worker));
+    let state = finish(server).await;
+    assert_eq!((state.counts().acked, state.results().len()), (1, 1));
+}
+
+/// A proxy that forwards the first connection until the server's `n`-th reply
+/// frame, then drops that reply and both sockets. Later connections pass
+/// through untouched.
+async fn lossy_proxy(server: SocketAddr, n: usize) -> SocketAddr {
+    use spool::protocol::read_frame;
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind(any_port()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut upstream = tokio::net::TcpStream::connect(server).await.unwrap();
+            if !std::mem::take(&mut first) {
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+                continue;
+            }
+            tokio::spawn(async move {
+                let (mut cr, mut cw) = client.into_split();
+                let (mut ur, mut uw) = upstream.into_split();
+                let up = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut cr, &mut uw).await;
+                });
+                for _ in 1..n {
+                    let Ok(Some(f)) = read_frame(&mut ur).await else {
+                        return;
+                    };
+                    let mut bytes = ((9 + f.body.len()) as u32).to_le_bytes().to_vec();
+                    bytes.push(f.kind);
+                    bytes.extend_from_slice(&f.id.to_le_bytes());
+                    bytes.extend_from_slice(&f.body);
+                    cw.write_all(&bytes).await.unwrap();
+                }
+                // The n-th reply: read it, so the request certainly landed, then lose it.
+                let _ = read_frame(&mut ur).await;
+                up.abort();
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_lost_complete_reply_is_retried_on_a_new_connection() {
+    let clock = ManualClock::new(0);
+    let server = start(&clock).await;
+    let c = Client::connect(server.local_addr()).await.unwrap();
+    let job = c
+        .enqueue(&q("a"), p("x"), Millis(0), None)
+        .await
+        .unwrap()
+        .job;
+    // Replies on the worker's first connection: hello_ok, leased, completed (lost).
+    let proxy = lossy_proxy(server.local_addr(), 3).await;
+    let mut worker = Worker::connect(&proxy.to_string(), q("a"), WorkerOptions::default())
+        .await
+        .unwrap();
+    let mut handler = |_| async { Ok::<_, ()>(p("done")) };
+    // The first complete landed; the retry on a new connection is a repeat
+    // by the same lease, and succeeds (D42).
+    assert_eq!(
+        worker.step(&mut handler).await.unwrap(),
+        Outcome::Completed(job)
+    );
+    assert_eq!(
+        c.result(job).await.unwrap(),
+        spool::ResultStatus::Done {
+            token: spool::Token(1),
+            payload: p("done")
+        }
+    );
+    drop((c, worker));
+    assert_eq!(finish(server).await.counts().acked, 1);
 }

@@ -15,7 +15,7 @@ producers / workers ──TCP──> node ────────────�
                          pure, deterministic, logical time ◄─────────────────────┘
 ```
 
-Today (M3): the reference queue (D17) behind the `Queue` trait (D11): leases with visibility
+Today (M4): the reference queue (D17) behind the `Queue` trait (D11): leases with visibility
 timeouts and fencing tokens (D5, D18), retries with capped exponential backoff and deterministic
 jitter (D13) under a per-queue policy (D14), expiry counted as an attempt (D15), a dead-letter state
 with redrive (D16), delayed jobs (D17) and deduplication keys (D35). Time arrives in every command
@@ -24,6 +24,9 @@ sequences. It is durable (D21–D29): a write-ahead log of commands, synced befo
 returned, with snapshots and crash-tested recovery. It is served over TCP (D30–D33): one core
 thread owns the queue and commits batches with one sync, connections are tokio tasks, and the
 server stamps the time (D31). A client and worker library (D34, D36) sit on the other side.
+Effectively-once processing holds inside a stated boundary (D40): a transactional complete stores a
+job's result with its ack in one command (D41, D42), and lease tokens fence writes to external
+stores (D43), tested against seeded worker crashes and zombies (D46).
 
 ## Decisions
 
@@ -599,6 +602,11 @@ server stamps the time (D31). A client and worker library (D34, D36) sit on the 
   token below one already accepted for that key ever succeeded; and the server's checkers pass
   after every batch.
 - **Alternatives:** kill real worker processes.
-- **Why:** from the server's side a dead worker is a connection that stops, which an aborted
-  task produces exactly. Seeds make every interleaving repeatable, the same property the M5
-  simulator generalises.
+- **Why:** from the server's side a dead worker is a connection that stops, which closing the
+  socket produces exactly. One scheduler drives every step and waits for each lost-reply complete
+  to land before going on, so a seed replays the same schedule every time (three runs print the
+  same coverage), the property the M5 simulator generalises.
+- **Run:** 200 seeds of 12 jobs, about 1.7 s in a debug build: 743 crashes before the effect, 696
+  after it, 734 lost replies, 669 cut requests, 723 zombies (144 of their writes refused by the
+  fence, 403 of their completes refused by the queue, 320 accepted because their lease was still
+  current), 677 normal completions. The test asserts every one of these cases was reached.

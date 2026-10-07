@@ -12,7 +12,12 @@ storage call and recovering every state a crash could leave on disk, including a
 recovery. Networked (M3): a TCP server with a small binary protocol and group commit (about 25x the
 throughput of one sync per command, D30), deduplication keys that survive restarts (D35), and an
 async client and worker library that heartbeats while a job runs and drops the job when its lease
-is lost (D36). Effectively-once processing (M4) comes next.
+is lost (D36). Effectively-once (M4) inside a stated boundary (D40): `complete` acks a job and
+stores its result in one log record, and is safe to repeat after a lost reply (D41, D42); lease
+tokens fence a worker's writes to other stores, so a worker that stalled past its lease cannot
+overwrite newer work (D43). A seeded test kills workers before and after their effects, loses their
+replies and wakes zombies, and checks that every job's effect is the one its completing lease made
+(D46). Tier 1 is done; the deterministic simulator (M5) comes next.
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
 ## Design in one paragraph
@@ -75,12 +80,29 @@ deduplicated job=1 queue=orders key=order-42
 leased job=1 token=1 deadline=1791415156480 attempt=1 payload=charge-card
 ```
 
-From Rust, a worker is a closure (`spool::worker`):
+From Rust, a worker is a closure (`spool::worker`). Returning `()` acks the job; returning a
+`Payload` completes it with that result (D44). The lease's token goes to the downstream write, so a
+store that checks it (D43, `spool::fence`) refuses a zombie's late write:
 
 ```rust
-let client = Client::connect("127.0.0.1:7878").await?;
-let worker = Worker::new(client, QueueName::new("orders")?, WorkerOptions::default());
-worker.run(|job| async move { charge(&job.payload).await }).await?;
+let mut worker = Worker::connect("127.0.0.1:7878", QueueName::new("orders")?, WorkerOptions::default()).await?;
+worker
+    .run(|job| async move {
+        // UPDATE charges SET receipt = $1, token = $2 WHERE order_id = $3 AND token <= $2
+        let receipt = charge(&job.payload, job.lease.token).await?;
+        Ok::<_, Error>(receipt) // stored as the job's result, with the ack, in one record
+    })
+    .await?;
+```
+
+A producer that lost the reply to its enqueue retries with the same key and gets the job id back
+(D35), then asks for the result:
+
+```
+> complete 1 1 receipt-77
+completed job=1 token=1
+> result 1
+result job=1 done token=1 payload=receipt-77
 ```
 
 Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a

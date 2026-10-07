@@ -34,7 +34,7 @@ impl Checked {
 /// The queue and the ledger must agree on every state's count, not just the
 /// total: a job the queue thinks is dead but the events say is waiting has the
 /// same total.
-fn agree(state: Counts, events: Counts) -> Result<(), String> {
+pub(crate) fn agree(state: Counts, events: Counts) -> Result<(), String> {
     if state != events {
         return Err(format!(
             "queue counts {state:?} disagree with the event ledger {events:?}"

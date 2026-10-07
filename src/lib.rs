@@ -17,6 +17,7 @@ pub mod queue;
 pub mod reference;
 pub mod retry;
 pub mod scenario;
+pub mod server;
 pub mod storage;
 pub mod types;
 pub mod wal;

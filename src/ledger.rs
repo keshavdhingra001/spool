@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use crate::command::Event;
-use crate::reference::Counts;
+use crate::reference::{Counts, JobState, ReferenceQueue};
 use crate::types::{DedupKey, JobId, Payload, QueueName, Token};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +44,41 @@ pub struct Ledger {
 impl Ledger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A ledger that starts from a recovered queue instead of from nothing,
+    /// built only from the queue's public views. Payloads are learned from
+    /// the next lease, and the last token is the largest one still held, a
+    /// lower bound: every check from here on is as strict, except that a token
+    /// reused from an acked job would go unnoticed.
+    pub fn resume(queue: &ReferenceQueue) -> Self {
+        let mut l = Ledger::new();
+        let c = queue.counts();
+        l.acked = c.acked;
+        for job in queue.jobs() {
+            let state = match job.state {
+                JobState::Waiting { .. } => State::Waiting,
+                JobState::Leased { token, .. } => {
+                    l.last_token = l.last_token.max(token.0);
+                    State::Leased(token)
+                }
+                JobState::Dead => State::Dead,
+            };
+            l.jobs.insert(
+                job.id,
+                Entry {
+                    state,
+                    attempts: job.attempts,
+                    payload: None,
+                },
+            );
+        }
+        // Every id up to the last one is live or acked (D19).
+        l.last_job = l.jobs.len() as u64 + c.acked;
+        for (queue, key, job, _) in queue.dedup_keys() {
+            l.keys.insert((queue, key), job);
+        }
+        l
     }
 
     /// Check the events one command produced, in order, and apply them.
@@ -234,6 +269,43 @@ mod tests {
         l.observe(&[keyed(4, "k"), dedup(4, "a", "k")]).unwrap();
         let c = l.counts();
         assert_eq!((c.waiting, c.leased, c.dead, c.acked), (3, 0, 0, 1));
+    }
+
+    #[test]
+    fn resumes_from_a_recovered_queue() {
+        use crate::queue::Queue;
+        let mut q = ReferenceQueue::new();
+        let mut out = Vec::new();
+        for line in [
+            "@0 enqueue a x key=k",
+            "@0 enqueue a y",
+            "@0 enqueue a z",
+            "@1 lease a 10",
+            "@1 ack 1 1",
+            "@1 lease a 10",
+        ] {
+            q.apply(&line.parse().unwrap(), &mut out);
+        }
+        let mut l = Ledger::resume(&q);
+        assert_eq!(l.counts(), q.counts());
+        l.observe(&[
+            Event::Released {
+                job: JobId(2),
+                token: Token(2),
+                reason: ReleaseReason::Nack,
+            },
+            retrying(2),
+        ])
+        .unwrap();
+        l.observe(&[dedup(1, "a", "k"), enqueued(4)]).unwrap();
+        // Still strict: the next id, the token order and the key's job.
+        assert!(Ledger::resume(&q).observe(&[enqueued(5)]).is_err());
+        assert!(
+            Ledger::resume(&q)
+                .observe(&[leased(3, 2, 1, b"z")])
+                .is_err()
+        );
+        assert!(Ledger::resume(&q).observe(&[dedup(2, "a", "k")]).is_err());
     }
 
     #[test]

@@ -2,9 +2,10 @@
 
 A distributed task queue in Rust, built from the bottom up: its own broker and storage (no Redis or
 Postgres underneath), leases with visibility timeouts and fencing tokens, effectively-once
-processing, Raft replication written from scratch, and partition testing by deterministic simulation.
+processing, and (in progress) Raft replication written from scratch and partition testing by
+deterministic simulation.
 
-**Status:** M3. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
+**Status:** M4, Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
 ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state with redrive
 (M1). Durable (M2): every command goes into a checksummed write-ahead log and is synced before
 its result is returned, with periodic snapshots and recovery that is tested by failing at every

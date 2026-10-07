@@ -411,3 +411,34 @@ async fn calls_fail_once_the_server_is_gone() {
     let err = c.enqueue(&q("a"), p("y"), Millis(0), None).await;
     assert!(matches!(err, Err(ClientError::Closed)), "{err:?}");
 }
+
+#[tokio::test]
+async fn a_reply_with_the_wrong_id_is_a_protocol_error() {
+    use spool::protocol::{self, Reply};
+    // A broken server: answers the hello, then replies to request 1 as if it
+    // were request 2 (D32).
+    let listener = tokio::net::TcpListener::bind(any_port()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let hello = protocol::read_frame(&mut s).await.unwrap().unwrap();
+        let mut out = Vec::new();
+        protocol::encode_reply(hello.id, &Reply::HelloOk { version: 1 }, &mut out);
+        protocol::write_all(&mut s, &out).await.unwrap();
+        let req = protocol::read_frame(&mut s).await.unwrap().unwrap();
+        out.clear();
+        protocol::encode_reply(req.id + 1, &Reply::Events(vec![]), &mut out);
+        protocol::write_all(&mut s, &out).await.unwrap();
+        // Keep the socket open: the client must not wait for more.
+        let _ = protocol::read_frame(&mut s).await;
+    });
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.request(Op::Tick).await;
+    assert!(
+        matches!(&err, Err(ClientError::Protocol(m)) if m.contains("expected 1")),
+        "{err:?}"
+    );
+    // The connection is unusable afterwards; later calls fail at once.
+    let later = tokio::time::timeout(Duration::from_secs(5), c.request(Op::Tick)).await;
+    assert!(matches!(later, Ok(Err(_))), "{later:?}");
+}

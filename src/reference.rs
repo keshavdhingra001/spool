@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn checker_catches_corruption() {
         type Corrupt = fn(&mut ReferenceQueue);
-        let corruptions: [(&str, Corrupt); 7] = [
+        let corruptions: [(&str, Corrupt); 8] = [
             ("lost lease index", |q| q.leases.clear()),
             ("lost job", |q| {
                 q.jobs.remove(&JobId(2));
@@ -532,6 +532,10 @@ mod tests {
             ("token from the future", |q| q.last_token = 0),
             ("overdue lease", |q| {
                 q.clock.advance(Time(1_000));
+            }),
+            // Job 1's deadline is 11; a lease is over at its deadline, not after it.
+            ("lease exactly at its deadline", |q| {
+                q.clock.advance(Time(11));
             }),
             ("bad config", |q| {
                 let qs = q.queues.get_mut(&QueueName::new("a").unwrap()).unwrap();

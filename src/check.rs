@@ -6,7 +6,7 @@
 use crate::command::{Command, Event};
 use crate::ledger::Ledger;
 use crate::queue::Queue;
-use crate::reference::ReferenceQueue;
+use crate::reference::{Counts, ReferenceQueue};
 
 #[derive(Clone, Debug, Default)]
 pub struct Checked {
@@ -26,12 +26,42 @@ impl Checked {
         self.queue.apply(cmd, &mut self.out);
         self.queue.check_invariants()?;
         self.ledger.observe(&self.out)?;
-        let (state, events) = (self.queue.counts(), self.ledger.counts());
-        if state != events {
-            return Err(format!(
-                "queue counts {state:?} disagree with the event ledger {events:?}"
-            ));
-        }
+        agree(self.queue.counts(), self.ledger.counts())?;
         Ok(&self.out)
+    }
+}
+
+/// The queue and the ledger must agree on every state's count, not just the
+/// total: a job the queue thinks is dead but the events say is waiting has the
+/// same total.
+fn agree(state: Counts, events: Counts) -> Result<(), String> {
+    if state != events {
+        return Err(format!(
+            "queue counts {state:?} disagree with the event ledger {events:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_must_agree_per_state() {
+        let c = Counts {
+            waiting: 2,
+            leased: 1,
+            dead: 0,
+            acked: 3,
+        };
+        assert_eq!(agree(c, c), Ok(()));
+        let moved = Counts {
+            waiting: 1,
+            dead: 1,
+            ..c
+        };
+        assert_eq!(moved.total(), c.total());
+        assert!(agree(c, moved).is_err());
     }
 }

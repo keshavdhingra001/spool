@@ -4,7 +4,10 @@ A distributed task queue in Rust, built from the bottom up: its own broker and s
 Postgres underneath), leases with visibility timeouts and fencing tokens, effectively-once
 processing, Raft replication written from scratch, and partition testing by deterministic simulation.
 
-**Status:** M0 (scaffold). The command/event model and text format exist; the queue itself arrives in M1.
+**Status:** M1. A single-node, in-memory reference queue: leases with visibility timeouts and fencing
+tokens, heartbeats, ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state
+with redrive. Checked after every command by an invariant checker and an independent event ledger, over
+scenario files and random command sequences. Durability (M2) and networking (M3) come next.
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
 ## Design in one paragraph
@@ -17,15 +20,28 @@ boundary by idempotency keys, fencing tokens and transactional acks (D3, D5).
 
 ## Try it
 
+The zombie worker, by hand: worker A's lease expires, worker B gets the job, A comes back.
+
 ```
 cargo run
-> @0 enqueue emails send:42
-parsed: @0 enqueue emails send:42
-> @5 lease emails 30000
-parsed: @5 lease emails 30000
+> @0 configure q 3 0 0
+configured queue=q max_attempts=3 backoff_base=0 backoff_cap=0
+> @0 enqueue q charge-card
+enqueued job=1 queue=q ready_at=0
+> @0 lease q 30
+leased job=1 token=1 deadline=30 attempt=1 payload=charge-card
+> @30 lease q 30
+released job=1 token=1 reason=expired
+retrying job=1 ready_at=30
+leased job=1 token=2 deadline=60 attempt=2 payload=charge-card
+> @41 ack 1 1
+rejected reason=stale_token
+> @50 ack 1 2
+acked job=1
 ```
 
-Type `help` for the full command list (D12).
+Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a
+scenario file (D20).
 
 ## Roadmap
 

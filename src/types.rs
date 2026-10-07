@@ -63,6 +63,27 @@ impl QueueName {
     }
 }
 
+/// Deduplication key of an enqueue (D35): 1 to [`DedupKey::MAX_LEN`] visible
+/// ASCII characters, so it is one whitespace-free token in the text format.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DedupKey(String);
+
+impl DedupKey {
+    pub const MAX_LEN: usize = 128;
+
+    pub fn new(key: &str) -> Result<DedupKey, ParseError> {
+        if key.is_empty() || key.len() > Self::MAX_LEN || !key.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(ParseError::BadKey(key.to_string()));
+        }
+        Ok(DedupKey(key.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The job's body: opaque bytes that only producers and workers interpret.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Payload(pub Vec<u8>);
@@ -158,6 +179,12 @@ impl fmt::Display for Token {
     }
 }
 
+impl fmt::Display for DedupKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl fmt::Display for QueueName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -195,6 +222,27 @@ mod tests {
                 QueueName::new(bad),
                 Err(ParseError::BadQueueName(bad.to_string()))
             );
+        }
+    }
+
+    #[test]
+    fn dedup_key_rules() {
+        for ok in [
+            "k",
+            "order-42:charge",
+            "a=b%c/d",
+            &"x".repeat(DedupKey::MAX_LEN),
+        ] {
+            assert_eq!(DedupKey::new(ok).unwrap().as_str(), ok);
+        }
+        for bad in [
+            "",
+            "has space",
+            "tab\t",
+            "é",
+            &"x".repeat(DedupKey::MAX_LEN + 1),
+        ] {
+            assert_eq!(DedupKey::new(bad), Err(ParseError::BadKey(bad.to_string())));
         }
     }
 

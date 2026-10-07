@@ -1,0 +1,37 @@
+# Deduplication keys (D35): a key repeated in the same queue within 5 minutes
+# of its first enqueue returns the original job instead of adding one.
+@0 enqueue orders charge-1 key=order-1
+= enqueued job=1 queue=orders ready_at=0 key=order-1
+# The producer lost the reply and retries with the same key: nothing new.
+@100 enqueue orders charge-1 key=order-1
+= deduplicated job=1 queue=orders key=order-1
+# The repeat's payload and delay are ignored; the key alone decides.
+@200 enqueue orders other delay=50 key=order-1
+= deduplicated job=1 queue=orders key=order-1
+# The same key in another queue is a different key.
+@300 enqueue refunds r-1 key=order-1
+= enqueued job=2 queue=refunds ready_at=300 key=order-1
+# Unkeyed enqueues are never deduplicated.
+@400 enqueue orders charge-1
+= enqueued job=3 queue=orders ready_at=400
+@500 lease orders 1000
+= leased job=1 token=1 deadline=1500 attempt=1 payload=charge-1
+@600 ack 1 1
+= acked job=1
+# The key outlives the job: a retry that arrives after a fast worker already
+# finished must not run the job a second time.
+@700 enqueue orders charge-1 key=order-1
+= deduplicated job=1 queue=orders key=order-1
+# The window ends 300000 ms after the first enqueue, exclusive like a lease
+# deadline (D18); repeats do not extend it.
+@299999 enqueue orders charge-1 key=order-1
+= deduplicated job=1 queue=orders key=order-1
+@300000 enqueue orders charge-1 key=order-1
+= enqueued job=4 queue=orders ready_at=300000 key=order-1
+# The new job starts a new window of its own.
+@300001 enqueue orders charge-1 key=order-1
+= deduplicated job=4 queue=orders key=order-1
+@300299 enqueue refunds r-1 key=order-1
+= deduplicated job=2 queue=refunds key=order-1
+@300300 enqueue refunds r-1 key=order-1
+= enqueued job=5 queue=refunds ready_at=300300 key=order-1

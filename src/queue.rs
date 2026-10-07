@@ -20,13 +20,17 @@ pub trait Queue {
 /// A queue whose whole state can be written out and read back (D27), so the
 /// durable wrapper (M2) can snapshot it instead of replaying the log forever.
 pub trait Snapshot: Queue + Default + Sized {
+    /// The version of the encoding `encode_state` writes. The durable wrapper
+    /// stores it in the snapshot header and hands it back to `decode_state`.
+    const STATE_VERSION: u32;
+
     /// Append the state's canonical encoding to `out`: two queues are in the
     /// same state exactly when their encodings are equal.
     fn encode_state(&self, out: &mut Vec<u8>);
 
-    /// Rebuild a queue from `encode_state`'s output, refusing bytes that do not
-    /// describe a valid state.
-    fn decode_state(bytes: &[u8]) -> Result<Self, DecodeError>;
+    /// Rebuild a queue from the output of `encode_state` at `version` (this
+    /// one or an older one), refusing bytes that do not describe a valid state.
+    fn decode_state(version: u32, bytes: &[u8]) -> Result<Self, DecodeError>;
 }
 
 /// The queue's logical clock (D9). It only moves forward: a command stamped

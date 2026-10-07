@@ -3,7 +3,9 @@
 //! Commands are generated as abstract actions and resolved against what the
 //! queue has said so far: a heartbeat, ack or nack picks one of the leases ever
 //! issued, so it is sometimes current, sometimes stale, expired or already acked.
-//! Times mostly move forward in small steps and sometimes jump back (D9).
+//! Times mostly move forward in small steps, sometimes jump back (D9), and
+//! rarely jump past the dedup window (D35), so keys are both repeated inside
+//! their window and reused after it.
 
 use std::collections::BTreeSet;
 
@@ -11,7 +13,7 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use spool::{
-    Checked, Command, Event, JobId, Millis, Op, Payload, Queue, QueueConfig, QueueName,
+    Checked, Command, DedupKey, Event, JobId, Millis, Op, Payload, Queue, QueueConfig, QueueName,
     ReferenceQueue, Time, Token,
 };
 
@@ -20,6 +22,7 @@ enum Action {
     Enqueue {
         queue: usize,
         delay: u64,
+        key: Option<usize>,
     },
     Lease {
         queue: usize,
@@ -55,12 +58,17 @@ struct Step {
 }
 
 const QUEUES: [&str; 2] = ["a", "b"];
+const KEYS: [&str; 3] = ["k0", "k1", "k2"];
 
 fn action() -> impl Strategy<Value = Action> {
     let queue = 0..QUEUES.len();
     prop_oneof![
-        4 => (queue.clone(), prop_oneof![3 => Just(0u64), 1 => 1..40u64])
-            .prop_map(|(queue, delay)| Action::Enqueue { queue, delay }),
+        4 => (
+            queue.clone(),
+            prop_oneof![3 => Just(0u64), 1 => 1..40u64],
+            prop_oneof![1 => Just(None), 1 => (0..KEYS.len()).prop_map(Some)],
+        )
+            .prop_map(|(queue, delay, key)| Action::Enqueue { queue, delay, key }),
         5 => (queue.clone(), 0..40u64).prop_map(|(queue, visibility)| Action::Lease { queue, visibility }),
         2 => (any::<usize>(), 0..40u64).prop_map(|(pick, visibility)| Action::Heartbeat { pick, visibility }),
         3 => any::<usize>().prop_map(|pick| Action::Ack { pick }),
@@ -73,7 +81,12 @@ fn action() -> impl Strategy<Value = Action> {
 }
 
 fn steps(max_len: usize) -> impl Strategy<Value = Vec<Step>> {
-    let dt = prop_oneof![8 => 0..15i64, 1 => -30..0i64, 1 => 15..200i64];
+    let dt = prop_oneof![
+        80 => 0..15i64,
+        10 => -30..0i64,
+        10 => 15..200i64,
+        1 => 250_000..400_000i64,
+    ];
     prop::collection::vec(
         (dt, action()).prop_map(|(dt, action)| Step { dt, action }),
         1..max_len,
@@ -99,10 +112,15 @@ impl Resolver {
             n => self.issued[p % n],
         };
         let op = match step.action {
-            Action::Enqueue { queue: q, delay } => Op::Enqueue {
+            Action::Enqueue {
+                queue: q,
+                delay,
+                key,
+            } => Op::Enqueue {
                 queue: queue(q),
                 payload: Payload(format!("p{}", self.at).into_bytes()),
                 delay: Millis(delay),
+                key: key.map(|k| DedupKey::new(KEYS[k]).unwrap()),
             },
             Action::Lease {
                 queue: q,
@@ -248,13 +266,28 @@ fn generator_covers_every_outcome() {
         let steps = strategy.new_tree(&mut runner).unwrap().current();
         let (_, events) = run_checked(&steps).unwrap();
         seen.extend(events.iter().map(event_kind));
+        // A key enqueued a second time created a job: its window had ended.
+        let mut keys = BTreeSet::new();
+        for e in &events {
+            if let Event::Enqueued {
+                queue,
+                key: Some(key),
+                ..
+            } = e
+                && !keys.insert((queue.clone(), key.clone()))
+            {
+                seen.insert("key reused after its window".to_string());
+            }
+        }
     }
     let expected = [
         "acked",
         "configured",
         "dead",
+        "deduplicated",
         "empty",
         "enqueued",
+        "key reused after its window",
         "leased",
         "redriven",
         "rejected bad_config",

@@ -4,7 +4,7 @@
 
 use proptest::prelude::*;
 use spool::codec::{decode_command, encode_command};
-use spool::{Command, JobId, Millis, Op, Payload, QueueConfig, QueueName, Time, Token};
+use spool::{Command, DedupKey, JobId, Millis, Op, Payload, QueueConfig, QueueName, Time, Token};
 
 fn queue() -> impl Strategy<Value = QueueName> {
     "[A-Za-z0-9_.-]{1,64}".prop_map(|s| QueueName::new(&s).unwrap())
@@ -18,12 +18,14 @@ fn op() -> impl Strategy<Value = Op> {
         (
             queue(),
             prop::collection::vec(any::<u8>(), 0..40),
-            ms.clone()
+            ms.clone(),
+            prop::option::of("[!-~]{1,128}"),
         )
-            .prop_map(|(queue, bytes, delay)| Op::Enqueue {
+            .prop_map(|(queue, bytes, delay, key)| Op::Enqueue {
                 queue,
                 payload: Payload(bytes),
                 delay,
+                key: key.map(|k| DedupKey::new(&k).unwrap()),
             }),
         (queue(), any::<u32>(), ms.clone(), ms.clone()).prop_map(|(queue, n, base, cap)| {
             Op::Configure {

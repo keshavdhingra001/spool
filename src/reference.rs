@@ -10,6 +10,8 @@
 //!   entry is the next job to lease, if its `ready_at` has come (D18).
 //! - per queue, `dead`: ids of dead-lettered jobs (D16).
 //! - `leases`: `(deadline, id)` of every leased job, so expiry pops from the front.
+//! - `dedup`: `(queue, key) -> (job, expires_at)` for every key still in its
+//!   window (D35), and `dedup_expiry`: the same entries by expiry time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -18,7 +20,10 @@ use crate::codec::{self, DecodeError, Reader};
 use crate::command::{Command, Event, Op, RejectReason, ReleaseReason};
 use crate::queue::{Clock, Queue, Snapshot};
 use crate::retry::QueueConfig;
-use crate::types::{JobId, Lease, Millis, Payload, QueueName, Time, Token};
+use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};
+
+/// How long a dedup key is remembered after the enqueue that used it (D35).
+pub const DEDUP_WINDOW: Millis = Millis(300_000);
 
 /// Where a job is in its life. Acked jobs are removed, not kept in a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,18 +88,22 @@ pub struct ReferenceQueue {
     queues: BTreeMap<QueueName, QueueState>,
     leases: BTreeSet<(Time, JobId)>,
     acked: u64,
+    dedup: BTreeMap<(QueueName, DedupKey), (JobId, Time)>,
+    dedup_expiry: BTreeSet<(Time, QueueName, DedupKey)>,
 }
 
 impl Queue for ReferenceQueue {
     fn apply(&mut self, cmd: &Command, out: &mut Vec<Event>) {
         let now = self.clock.advance(cmd.at);
         self.expire(now, out);
+        self.expire_keys(now);
         match &cmd.op {
             Op::Enqueue {
                 queue,
                 payload,
                 delay,
-            } => self.enqueue(now, queue, payload, *delay, out),
+                key,
+            } => self.enqueue(now, queue, payload, *delay, key.as_ref(), out),
             Op::Lease { queue, visibility } => self.lease(now, queue, *visibility, out),
             Op::Heartbeat {
                 job,
@@ -140,6 +149,19 @@ impl ReferenceQueue {
         }
     }
 
+    /// Forget every dedup key whose window ended at or before `now` (D35). The
+    /// boundary is exclusive like a lease's (D18). No events: a key ending is
+    /// not something a client can observe except by reusing it.
+    fn expire_keys(&mut self, now: Time) {
+        while let Some((expires_at, ..)) = self.dedup_expiry.first() {
+            if *expires_at > now {
+                break;
+            }
+            let (_, queue, key) = self.dedup_expiry.pop_first().expect("checked");
+            self.dedup.remove(&(queue, key));
+        }
+    }
+
     /// A lease of `id` ended without an ack at `at`: retry after a backoff, or
     /// dead-letter it if that was its last attempt (D13, D15). The caller has
     /// already removed it from `leases`.
@@ -164,11 +186,32 @@ impl ReferenceQueue {
         queue: &QueueName,
         payload: &Payload,
         delay: Millis,
+        key: Option<&DedupKey>,
         out: &mut Vec<Event>,
     ) {
+        if let Some(key) = key
+            && let Some(&(job, _)) = self.dedup.get(&(queue.clone(), key.clone()))
+        {
+            out.push(Event::Deduplicated {
+                job,
+                queue: queue.clone(),
+                key: key.clone(),
+            });
+            return;
+        }
         self.last_job += 1;
         let id = JobId(self.last_job);
         let ready_at = now.plus(delay);
+        if let Some(key) = key {
+            let expires_at = now.plus(DEDUP_WINDOW);
+            // At the very end of time the window saturates to nothing.
+            if expires_at > now {
+                self.dedup
+                    .insert((queue.clone(), key.clone()), (id, expires_at));
+                self.dedup_expiry
+                    .insert((expires_at, queue.clone(), key.clone()));
+            }
+        }
         self.queue_mut(queue).waiting.insert((ready_at, id));
         self.jobs.insert(
             id,
@@ -183,6 +226,7 @@ impl ReferenceQueue {
             job: id,
             queue: queue.clone(),
             ready_at,
+            key: key.cloned(),
         });
     }
 
@@ -352,6 +396,15 @@ impl ReferenceQueue {
         self.queues.get(queue).map(|q| q.config)
     }
 
+    /// Every remembered dedup key (D35): `(queue, key, job, expires_at)`, in
+    /// `(queue, key)` order.
+    pub fn dedup_keys(&self) -> Vec<(QueueName, DedupKey, JobId, Time)> {
+        self.dedup
+            .iter()
+            .map(|((q, k), &(job, at))| (q.clone(), k.clone(), job, at))
+            .collect()
+    }
+
     /// Check every structural invariant (D19). Called after every command in
     /// tests; too slow (linear in the number of jobs) for the hot path.
     pub fn check_invariants(&self) -> Result<(), String> {
@@ -414,6 +467,30 @@ impl ReferenceQueue {
                 return Err(format!("queue {name}: invalid config {:?}", q.config));
             }
         }
+        // Dedup keys (D35): each names an assigned job, is still in its window,
+        // was created no later than now, and the expiry index matches exactly.
+        for ((queue, key), &(job, expires_at)) in &self.dedup {
+            let what = format!("dedup key {queue}/{key}");
+            if job.0 == 0 || job.0 > self.last_job {
+                return Err(format!("{what}: job {job} was never assigned"));
+            }
+            if expires_at <= now || expires_at > now.plus(DEDUP_WINDOW) {
+                return Err(format!("{what}: expires at {expires_at}, now {now}"));
+            }
+            if !self
+                .dedup_expiry
+                .contains(&(expires_at, queue.clone(), key.clone()))
+            {
+                return Err(format!("{what}: missing from the expiry index"));
+            }
+        }
+        if self.dedup_expiry.len() != self.dedup.len() {
+            return Err(format!(
+                "{} dedup expiry entries for {} keys",
+                self.dedup_expiry.len(),
+                self.dedup.len()
+            ));
+        }
         Ok(())
     }
 }
@@ -429,10 +506,14 @@ const DEAD: u8 = 3;
 /// queue_count:u32 { name config }            in name order
 /// job_count:u64   { id:u64 name payload attempts:u32 state }   in id order
 /// state = 1 ready_at:u64 | 2 token:u64 deadline:u64 | 3
+/// key_count:u64   { name key job:u64 expires_at:u64 }   in (name, key) order, version 2 only
 /// ```
 ///
-/// The indexes are not stored: they are rebuilt from the jobs.
+/// The indexes are not stored: they are rebuilt from the jobs and keys.
+/// Version 1 (M2) has no key table and loads with none (D35).
 impl Snapshot for ReferenceQueue {
+    const STATE_VERSION: u32 = 2;
+
     fn encode_state(&self, out: &mut Vec<u8>) {
         codec::put_u64(out, self.clock.now().0);
         codec::put_u64(out, self.last_job);
@@ -467,9 +548,21 @@ impl Snapshot for ReferenceQueue {
                 JobState::Dead => out.push(DEAD),
             }
         }
+        codec::put_u64(out, self.dedup.len() as u64);
+        for ((queue, key), &(job, expires_at)) in &self.dedup {
+            codec::put_name(out, queue);
+            codec::put_key(out, key);
+            codec::put_u64(out, job.0);
+            codec::put_u64(out, expires_at.0);
+        }
     }
 
-    fn decode_state(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn decode_state(version: u32, bytes: &[u8]) -> Result<Self, DecodeError> {
+        if !(1..=Self::STATE_VERSION).contains(&version) {
+            return Err(DecodeError::Invalid(format!(
+                "unknown snapshot version {version}"
+            )));
+        }
         let mut r = Reader::new(bytes);
         let mut clock = Clock::default();
         clock.advance(Time(r.u64()?));
@@ -547,6 +640,23 @@ impl Snapshot for ReferenceQueue {
                     state,
                 },
             );
+        }
+        if version >= 2 {
+            let mut prev: Option<(QueueName, DedupKey)> = None;
+            for _ in 0..r.u64()? {
+                let entry = (r.name()?, r.key()?);
+                if prev.as_ref().is_some_and(|p| *p >= entry) {
+                    return Err(invalid(format!(
+                        "dedup key {}/{} out of order",
+                        entry.0, entry.1
+                    )));
+                }
+                let (job, expires_at) = (JobId(r.u64()?), Time(r.u64()?));
+                q.dedup_expiry
+                    .insert((expires_at, entry.0.clone(), entry.1.clone()));
+                q.dedup.insert(entry.clone(), (job, expires_at));
+                prev = Some(entry);
+            }
         }
         r.finish()?;
         // Everything else a valid state must satisfy (D19): ids and tokens
@@ -649,6 +759,77 @@ mod tests {
     }
 
     #[test]
+    fn dedup_window_saturates_at_the_end_of_time() {
+        let mut q = ReferenceQueue::new();
+        let max = u64::MAX;
+        let got = run(
+            &mut q,
+            &[
+                &format!("@{} enqueue a x key=k", max - 1),
+                &format!("@{} enqueue a x key=k", max - 1),
+                &format!("@{max} enqueue a x key=k"),
+                &format!("@{max} enqueue a x key=k"),
+            ],
+        );
+        // At max - 1 the window is one millisecond; at max it is empty, so
+        // nothing is remembered and every enqueue adds a job.
+        assert_eq!(
+            got,
+            [
+                format!("enqueued job=1 queue=a ready_at={} key=k", max - 1),
+                "deduplicated job=1 queue=a key=k".to_string(),
+                format!("enqueued job=2 queue=a ready_at={max} key=k"),
+                format!("enqueued job=3 queue=a ready_at={max} key=k"),
+            ]
+        );
+        assert!(q.dedup_keys().is_empty());
+    }
+
+    #[test]
+    fn checker_catches_dedup_corruption() {
+        let keyed = || {
+            let mut q = queue_with_lease();
+            run(&mut q, &["@2 enqueue a z key=k"]);
+            q
+        };
+        type Corrupt = fn(&mut ReferenceQueue);
+        let corruptions: [(&str, Corrupt); 5] = [
+            ("lost expiry index", |q| q.dedup_expiry.clear()),
+            ("extra expiry entry", |q| {
+                let (k, _) = q.dedup.pop_first().unwrap();
+                q.dedup_expiry.insert((Time(9), k.0, k.1));
+                q.dedup.insert(
+                    (QueueName::new("b").unwrap(), DedupKey::new("j").unwrap()),
+                    (JobId(1), Time(9)),
+                );
+            }),
+            ("key past its window", |q| {
+                q.clock.advance(Time(2).plus(DEDUP_WINDOW));
+                q.leases.clear();
+                q.jobs
+                    .retain(|_, j| !matches!(j.state, JobState::Leased { .. }));
+                q.acked += 1;
+            }),
+            ("key names a job never assigned", |q| {
+                q.dedup.values_mut().for_each(|e| e.0 = JobId(99));
+            }),
+            ("key from the future", |q| {
+                let ((name, key), (job, at)) = q.dedup.pop_first().unwrap();
+                q.dedup_expiry.clear();
+                let later = at.plus(Millis(1));
+                q.dedup.insert((name.clone(), key.clone()), (job, later));
+                q.dedup_expiry.insert((later, name, key));
+            }),
+        ];
+        keyed().check_invariants().unwrap();
+        for (name, corrupt) in corruptions {
+            let mut q = keyed();
+            corrupt(&mut q);
+            assert!(q.check_invariants().is_err(), "{name} not detected");
+        }
+    }
+
+    #[test]
     fn checker_catches_corruption() {
         type Corrupt = fn(&mut ReferenceQueue);
         let corruptions: [(&str, Corrupt); 8] = [
@@ -706,19 +887,24 @@ mod tests {
                 "@1 nack 2 2",
                 "@1 enqueue a z delay=50",
                 "@1 configure b 2 5 9",
+                "@1 enqueue b k1 key=x",
+                "@1 enqueue a k2 key=x",
             ],
         );
+        assert_eq!(q.dedup_keys().len(), 2);
         let c = q.counts();
-        assert_eq!((c.waiting, c.leased, c.dead), (1, 1, 1));
+        assert_eq!((c.waiting, c.leased, c.dead), (3, 1, 1));
         let bytes = snapshot(&q);
-        let back = ReferenceQueue::decode_state(&bytes).unwrap();
+        let back = ReferenceQueue::decode_state(2, &bytes).unwrap();
         assert_eq!(snapshot(&back), bytes);
         assert_eq!(back.jobs(), q.jobs());
+        assert_eq!(back.dedup_keys(), q.dedup_keys());
         assert_eq!(back.counts(), q.counts());
         assert_eq!(back.now(), q.now());
         // The rebuilt indexes behave like the originals.
         let more = [
             "@2 lease a 10",
+            "@3 enqueue a again key=x",
             "@20 redrive a",
             "@20 lease a 5",
             "@60 tick",
@@ -729,18 +915,62 @@ mod tests {
     }
 
     #[test]
+    fn version_1_snapshots_load_with_no_keys() {
+        // Version 1 (M2) is version 2 without the key table at the end.
+        let q = queue_with_lease();
+        let v2 = snapshot(&q);
+        let v1 = &v2[..v2.len() - 8];
+        let back = ReferenceQueue::decode_state(1, v1).unwrap();
+        assert_eq!(snapshot(&back), v2);
+        assert_eq!(
+            ReferenceQueue::decode_state(1, &v2).unwrap_err(),
+            DecodeError::TrailingBytes(8)
+        );
+        for version in [0, 3] {
+            assert!(matches!(
+                ReferenceQueue::decode_state(version, &v2),
+                Err(DecodeError::Invalid(m)) if m.contains("unknown snapshot version")
+            ));
+        }
+    }
+
+    #[test]
+    fn snapshot_refuses_bad_key_tables() {
+        let mut q = queue_with_lease();
+        run(&mut q, &["@2 enqueue a z key=k1", "@2 enqueue a z key=k2"]);
+        let bytes = snapshot(&q);
+        // Each entry is name (2) + key (3) + job (8) + expires_at (8) = 21 bytes.
+        let second_key = bytes.len() - 21 + 2 + 1;
+        assert_eq!(&bytes[second_key..second_key + 2], b"k2");
+        let mut swapped = bytes.clone();
+        swapped[second_key + 1] = b'0';
+        assert!(matches!(
+            ReferenceQueue::decode_state(2, &swapped),
+            Err(DecodeError::Invalid(m)) if m.contains("dedup key a/k0 out of order")
+        ));
+        // A key past its window is refused by the invariant checker.
+        let mut stale = bytes.clone();
+        let expires = bytes.len() - 8;
+        stale[expires..].copy_from_slice(&2u64.to_le_bytes());
+        assert!(matches!(
+            ReferenceQueue::decode_state(2, &stale),
+            Err(DecodeError::Invalid(m)) if m.contains("expires at 2")
+        ));
+    }
+
+    #[test]
     fn snapshot_decode_refuses_invalid_states() {
         let bytes = snapshot(&queue_with_lease());
         for len in 0..bytes.len() {
             assert!(
-                ReferenceQueue::decode_state(&bytes[..len]).is_err(),
+                ReferenceQueue::decode_state(2, &bytes[..len]).is_err(),
                 "{len}"
             );
         }
         let mut long = bytes.clone();
         long.push(0);
         assert_eq!(
-            ReferenceQueue::decode_state(&long).unwrap_err(),
+            ReferenceQueue::decode_state(2, &long).unwrap_err(),
             DecodeError::TrailingBytes(1)
         );
         // States whose bytes parse but break an invariant (D19).
@@ -764,7 +994,7 @@ mod tests {
         for (name, corrupt) in corruptions {
             let mut q = queue_with_lease();
             corrupt(&mut q);
-            let err = ReferenceQueue::decode_state(&snapshot(&q));
+            let err = ReferenceQueue::decode_state(2, &snapshot(&q));
             assert!(
                 matches!(err, Err(DecodeError::Invalid(_))),
                 "{name}: {err:?}"
@@ -775,7 +1005,7 @@ mod tests {
         let mut swapped = bytes.clone();
         swapped[66] = 7;
         assert!(matches!(
-            ReferenceQueue::decode_state(&swapped),
+            ReferenceQueue::decode_state(2, &swapped),
             Err(DecodeError::Invalid(m)) if m.contains("out of order")
         ));
         // A duplicate id is out of order too (the invariant checker would also
@@ -785,7 +1015,7 @@ mod tests {
         assert_eq!(duplicate[job2], 2);
         duplicate[job2] = 1;
         assert!(matches!(
-            ReferenceQueue::decode_state(&duplicate),
+            ReferenceQueue::decode_state(2, &duplicate),
             Err(DecodeError::Invalid(m)) if m.contains("job 1 out of order")
         ));
         let mut bad_tag = bytes;
@@ -793,7 +1023,7 @@ mod tests {
         assert_eq!(bad_tag[job1_state], LEASED);
         bad_tag[job1_state] = 9;
         assert_eq!(
-            ReferenceQueue::decode_state(&bad_tag).unwrap_err(),
+            ReferenceQueue::decode_state(2, &bad_tag).unwrap_err(),
             DecodeError::UnknownTag {
                 what: "job state",
                 tag: 9

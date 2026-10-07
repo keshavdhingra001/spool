@@ -42,7 +42,8 @@ impl Backend {
 
 const HELP: &str = "\
 commands (every queue command starts with its logical time in ms):
-  @<ms> enqueue   <queue> <payload> [delay=<ms>]   payload: visible ASCII, %XX escapes, - for empty
+  @<ms> enqueue   <queue> <payload> [delay=<ms>] [key=<key>]
+                  payload: visible ASCII, %XX escapes, - for empty; key: dedup key (5 min)
   @<ms> lease     <queue> <visibility_ms>
   @<ms> heartbeat <job> <token> <visibility_ms>
   @<ms> ack       <job> <token>
@@ -120,6 +121,9 @@ fn main() -> io::Result<()> {
                 );
                 for job in queue.queue().jobs() {
                     println!("  {job}");
+                }
+                for (q, key, job, expires_at) in queue.queue().dedup_keys() {
+                    println!("  key={key} queue={q} job={job} expires_at={expires_at}");
                 }
             }
             input if input.starts_with("run ") => {

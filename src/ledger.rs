@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::command::Event;
 use crate::reference::Counts;
-use crate::types::{JobId, Payload, Token};
+use crate::types::{DedupKey, JobId, Payload, QueueName, Token};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -35,6 +35,10 @@ pub struct Ledger {
     last_job: u64,
     last_token: u64,
     acked: u64,
+    /// The job each dedup key's latest enqueue created (D35). The ledger has no
+    /// clock, so it cannot tell when a key's window ends; it checks only that a
+    /// `Deduplicated` names the job that key last created.
+    keys: BTreeMap<(QueueName, DedupKey), JobId>,
 }
 
 impl Ledger {
@@ -56,11 +60,16 @@ impl Ledger {
 
     fn observe_one(&mut self, event: &Event) -> Result<(), String> {
         match event {
-            Event::Enqueued { job, .. } => {
+            Event::Enqueued {
+                job, queue, key, ..
+            } => {
                 if job.0 != self.last_job + 1 {
                     return Err(format!("expected id {}", self.last_job + 1));
                 }
                 self.last_job = job.0;
+                if let Some(key) = key {
+                    self.keys.insert((queue.clone(), key.clone()), *job);
+                }
                 self.jobs.insert(
                     *job,
                     Entry {
@@ -115,6 +124,12 @@ impl Ledger {
                 e.state = State::Waiting;
                 e.attempts = 0;
             }
+            Event::Deduplicated { job, queue, key } => {
+                let first = self.keys.get(&(queue.clone(), key.clone()));
+                if first != Some(job) {
+                    return Err(format!("key was last enqueued as {first:?}"));
+                }
+            }
             Event::Empty { .. } | Event::Configured { .. } | Event::Rejected { .. } => {}
         }
         Ok(())
@@ -157,6 +172,24 @@ mod tests {
             job: JobId(job),
             queue: QueueName::new("a").unwrap(),
             ready_at: Time(0),
+            key: None,
+        }
+    }
+
+    fn keyed(job: u64, key: &str) -> Event {
+        Event::Enqueued {
+            job: JobId(job),
+            queue: QueueName::new("a").unwrap(),
+            ready_at: Time(0),
+            key: Some(DedupKey::new(key).unwrap()),
+        }
+    }
+
+    fn dedup(job: u64, queue: &str, key: &str) -> Event {
+        Event::Deduplicated {
+            job: JobId(job),
+            queue: QueueName::new(queue).unwrap(),
+            key: DedupKey::new(key).unwrap(),
         }
     }
 
@@ -195,13 +228,26 @@ mod tests {
         l.observe(&[released(1, 1), retrying(1)]).unwrap();
         l.observe(&[leased(1, 2, 2, b"x")]).unwrap();
         l.observe(&[Event::Acked { job: JobId(1) }]).unwrap();
+        // A key still answers with its job after the job is acked (D35), and
+        // a key reused after its window points at the new job.
+        l.observe(&[keyed(3, "k"), dedup(3, "a", "k")]).unwrap();
+        l.observe(&[keyed(4, "k"), dedup(4, "a", "k")]).unwrap();
         let c = l.counts();
-        assert_eq!((c.waiting, c.leased, c.dead, c.acked), (1, 0, 0, 1));
+        assert_eq!((c.waiting, c.leased, c.dead, c.acked), (3, 0, 0, 1));
     }
 
     #[test]
     fn rejects_impossible_histories() {
-        let bad: [(&str, Vec<Vec<Event>>); 8] = [
+        let bad: [(&str, Vec<Vec<Event>>); 11] = [
+            ("dedup of unknown key", vec![vec![dedup(1, "a", "k")]]),
+            (
+                "dedup names the wrong job",
+                vec![vec![keyed(1, "k"), enqueued(2), dedup(2, "a", "k")]],
+            ),
+            (
+                "dedup in the wrong queue",
+                vec![vec![keyed(1, "k"), dedup(1, "b", "k")]],
+            ),
             ("skipped id", vec![vec![enqueued(2)]]),
             ("lease unknown", vec![vec![leased(1, 1, 1, b"")]]),
             (

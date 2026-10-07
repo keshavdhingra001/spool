@@ -17,12 +17,16 @@ pub enum ParseError {
         expected: &'static str,
         got: usize,
     },
-    #[error("unknown option `{0}` (enqueue takes delay=<ms>)")]
+    #[error("unknown option `{0}` (enqueue takes delay=<ms> and key=<key>)")]
     BadOption(String),
     #[error("invalid {field} `{value}`")]
     BadNumber { field: &'static str, value: String },
     #[error("invalid queue name `{0}` (1-64 characters from A-Z a-z 0-9 _ . -)")]
     BadQueueName(String),
+    #[error("invalid dedup key `{0}` (1-128 visible ASCII characters)")]
+    BadKey(String),
+    #[error("option `{0}` given twice")]
+    DuplicateOption(String),
     #[error("invalid payload `{0}` (visible ASCII, %XX escapes, `-` for empty)")]
     BadPayload(String),
 }

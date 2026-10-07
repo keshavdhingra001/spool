@@ -192,9 +192,10 @@ fn workload(seed: u64, n: usize) -> Vec<Command> {
         let queue = ["a", "b"][rng.below(2) as usize];
         let line = match rng.below(10) {
             0..=2 => format!(
-                "@{now} enqueue {queue} p{} delay={}",
+                "@{now} enqueue {queue} p{} delay={}{}",
                 cmds.len(),
-                rng.below(8)
+                rng.below(8),
+                ["", " key=k1", " key=k2"][rng.below(3) as usize]
             ),
             3 | 4 => format!("@{now} lease {queue} {}", 1 + rng.below(12)),
             5..=7 if !leases.is_empty() => {

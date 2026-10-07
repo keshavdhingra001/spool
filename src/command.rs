@@ -8,7 +8,7 @@
 //! Every command starts with its logical time in milliseconds (D9):
 //!
 //! ```text
-//! @<ms> enqueue   <queue> <payload> [delay=<ms>]
+//! @<ms> enqueue   <queue> <payload> [delay=<ms>] [key=<key>]
 //! @<ms> lease     <queue> <visibility_ms>
 //! @<ms> heartbeat <job> <token> <visibility_ms>
 //! @<ms> ack       <job> <token>
@@ -23,7 +23,7 @@ use std::str::FromStr;
 
 use crate::error::ParseError;
 use crate::retry::QueueConfig;
-use crate::types::{JobId, Lease, Millis, Payload, QueueName, Time, Token};
+use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};
 
 /// One input to the queue: an operation stamped with the time it happens at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,10 +38,13 @@ pub struct Command {
 pub enum Op {
     /// Add a job to `queue`, leasable from `now + delay` (D17). The queue
     /// assigns its id (D10) and creates the queue with default settings if needed.
+    /// With a `key` already used in `queue` within the last 5 minutes, nothing is
+    /// added and the original job's id is returned (D35).
     Enqueue {
         queue: QueueName,
         payload: Payload,
         delay: Millis,
+        key: Option<DedupKey>,
     },
     /// Lease the ready job with the smallest `(ready_at, id)` in `queue` (D18), hidden from other workers until
     /// `now + visibility`.
@@ -79,6 +82,14 @@ pub enum Event {
         job: JobId,
         queue: QueueName,
         ready_at: Time,
+        key: Option<DedupKey>,
+    },
+    /// A keyed enqueue repeated a key still in its window (D35): nothing was
+    /// added, and `job` is the job the key's first enqueue created.
+    Deduplicated {
+        job: JobId,
+        queue: QueueName,
+        key: DedupKey,
     },
     /// A worker got a job. `attempt` counts leases of this job, starting at 1.
     Leased {
@@ -151,20 +162,26 @@ impl FromStr for Command {
             .ok_or_else(|| ParseError::UnknownCommand(String::new()))?;
         let op = match name {
             "enqueue" => {
-                expect_args("enqueue", args, 2..=3, "2 or 3")?;
-                let delay = match args.get(2) {
-                    None => Millis(0),
-                    Some(arg) => {
-                        let ms = arg
-                            .strip_prefix("delay=")
-                            .ok_or_else(|| ParseError::BadOption(arg.to_string()))?;
-                        Millis(parse_num("delay", ms)?)
+                expect_args("enqueue", args, 2..=4, "2 to 4")?;
+                let (mut delay, mut key) = (None, None);
+                for &arg in &args[2..] {
+                    if let Some(ms) = arg.strip_prefix("delay=") {
+                        if delay.replace(Millis(parse_num("delay", ms)?)).is_some() {
+                            return Err(ParseError::DuplicateOption("delay".into()));
+                        }
+                    } else if let Some(k) = arg.strip_prefix("key=") {
+                        if key.replace(DedupKey::new(k)?).is_some() {
+                            return Err(ParseError::DuplicateOption("key".into()));
+                        }
+                    } else {
+                        return Err(ParseError::BadOption(arg.to_string()));
                     }
-                };
+                }
                 Op::Enqueue {
                     queue: QueueName::new(args[0])?,
                     payload: Payload::parse(args[1])?,
-                    delay,
+                    delay: delay.unwrap_or_default(),
+                    key,
                 }
             }
             "lease" => {
@@ -263,11 +280,15 @@ impl fmt::Display for Command {
                 queue,
                 payload,
                 delay,
+                key,
             } => {
                 write!(f, "enqueue {queue} {payload}")?;
                 // Delay 0 is the default and is left out, so each command has one line form.
                 if delay.0 > 0 {
                     write!(f, " delay={delay}")?;
+                }
+                if let Some(key) = key {
+                    write!(f, " key={key}")?;
                 }
                 Ok(())
             }
@@ -294,7 +315,17 @@ impl fmt::Display for Event {
                 job,
                 queue,
                 ready_at,
-            } => write!(f, "enqueued job={job} queue={queue} ready_at={ready_at}"),
+                key,
+            } => {
+                write!(f, "enqueued job={job} queue={queue} ready_at={ready_at}")?;
+                if let Some(key) = key {
+                    write!(f, " key={key}")?;
+                }
+                Ok(())
+            }
+            Event::Deduplicated { job, queue, key } => {
+                write!(f, "deduplicated job={job} queue={queue} key={key}")
+            }
             Event::Leased {
                 lease,
                 attempt,
@@ -373,6 +404,7 @@ mod tests {
                         queue: q("emails"),
                         payload: Payload(b"send:42".to_vec()),
                         delay: Millis(0),
+                        key: None,
                     },
                 ),
             ),
@@ -384,6 +416,19 @@ mod tests {
                         queue: q("emails"),
                         payload: Payload(Vec::new()),
                         delay: Millis(500),
+                        key: None,
+                    },
+                ),
+            ),
+            (
+                "@0 enqueue emails x delay=5 key=order-7",
+                cmd(
+                    0,
+                    Op::Enqueue {
+                        queue: q("emails"),
+                        payload: Payload(b"x".to_vec()),
+                        delay: Millis(5),
+                        key: Some(DedupKey::new("order-7").unwrap()),
                     },
                 ),
             ),
@@ -493,8 +538,17 @@ mod tests {
             ),
             ("@1", UnknownCommand(String::new())),
             ("@1 push q x", UnknownCommand("push".into())),
-            ("@1 enqueue q", wrong("enqueue", "2 or 3", 1)),
-            ("@1 enqueue q a delay=1 b", wrong("enqueue", "2 or 3", 4)),
+            ("@1 enqueue q", wrong("enqueue", "2 to 4", 1)),
+            (
+                "@1 enqueue q a delay=1 key=k b",
+                wrong("enqueue", "2 to 4", 5),
+            ),
+            (
+                "@1 enqueue q a delay=1 delay=2",
+                DuplicateOption("delay".into()),
+            ),
+            ("@1 enqueue q a key=x key=y", DuplicateOption("key".into())),
+            ("@1 enqueue q a key=", BadKey(String::new())),
             ("@1 enqueue q a b", BadOption("b".into())),
             ("@1 enqueue q a delay=", num("delay", "")),
             ("@1 enqueue q a delay=-5", num("delay", "-5")),
@@ -533,8 +587,26 @@ mod tests {
                     job: JobId(3),
                     queue: q("emails"),
                     ready_at: Time(500),
+                    key: None,
                 },
                 "enqueued job=3 queue=emails ready_at=500",
+            ),
+            (
+                Event::Enqueued {
+                    job: JobId(3),
+                    queue: q("emails"),
+                    ready_at: Time(500),
+                    key: Some(DedupKey::new("k1").unwrap()),
+                },
+                "enqueued job=3 queue=emails ready_at=500 key=k1",
+            ),
+            (
+                Event::Deduplicated {
+                    job: JobId(3),
+                    queue: q("emails"),
+                    key: DedupKey::new("k1").unwrap(),
+                },
+                "deduplicated job=3 queue=emails key=k1",
             ),
             (
                 Event::Leased {

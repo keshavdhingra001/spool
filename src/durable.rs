@@ -20,7 +20,6 @@ use crate::wal::{self, parse_lsn_name, parse_segment_name, segment_name};
 
 const SNAP_PREFIX: &str = "snap-";
 const SNAP_MAGIC: &[u8; 8] = b"SPOOLSNP";
-const SNAP_VERSION: u32 = 1;
 /// `magic version:u32 lsn:u64 body_len:u64 crc:u32`, crc over the first 28
 /// bytes and the body.
 const SNAP_HEADER_LEN: usize = 32;
@@ -340,7 +339,7 @@ fn snap_name(lsn: u64) -> String {
 
 fn encode_snapshot<Q: Snapshot>(queue: &Q, lsn: u64, out: &mut Vec<u8>) {
     out.extend_from_slice(SNAP_MAGIC);
-    out.extend_from_slice(&SNAP_VERSION.to_le_bytes());
+    out.extend_from_slice(&Q::STATE_VERSION.to_le_bytes());
     out.extend_from_slice(&lsn.to_le_bytes());
     out.extend_from_slice(&[0; 12]); // body length and CRC, filled in below
     queue.encode_state(out);
@@ -370,13 +369,13 @@ fn load_snapshot<S: Storage, Q: Snapshot>(storage: &S, lsn: u64) -> Result<Q, St
     if crc32c::crc32c_append(crc32c::crc32c(&bytes[..28]), body) != crc {
         return Err(corrupt(28, "snapshot checksum mismatch".into()));
     }
-    if version != SNAP_VERSION {
+    if version == 0 || version > Q::STATE_VERSION {
         return Err(corrupt(8, format!("unknown snapshot version {version}")));
     }
     if field(12) != lsn || field(20) != body.len() as u64 {
         return Err(corrupt(12, "header disagrees with the file".into()));
     }
-    Q::decode_state(body).map_err(|e| corrupt(SNAP_HEADER_LEN, e.to_string()))
+    Q::decode_state(version, body).map_err(|e| corrupt(SNAP_HEADER_LEN, e.to_string()))
 }
 
 #[cfg(test)]
@@ -579,6 +578,35 @@ mod tests {
         wal::encode_header(6, &mut next);
         files.insert(segment_name(6), next);
         assert!(corruption(reopen(files)).contains("not the last"));
+    }
+
+    #[test]
+    fn loads_a_version_1_snapshot() {
+        // Rewrite run(8, 3)'s snapshot as M2 wrote it: version 1, no key table.
+        let mut files = run(8, 3).files();
+        let snap = files.get_mut("snap-00000000000000000006").unwrap();
+        snap.truncate(snap.len() - 8);
+        snap[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let body_len = (snap.len() - SNAP_HEADER_LEN) as u64;
+        snap[20..28].copy_from_slice(&body_len.to_le_bytes());
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&snap[..28]), &snap[SNAP_HEADER_LEN..]);
+        snap[28..32].copy_from_slice(&crc.to_le_bytes());
+        let (mut d, rec) = reopen(files.clone()).unwrap();
+        assert_eq!((rec.snapshot_lsn, rec.replayed), (6, 2));
+        assert_eq!(state(d.queue()), reference(8));
+        // The next snapshot is written as version 2.
+        d.snapshot().unwrap();
+        let files = d.storage().files();
+        assert_eq!(
+            files["snap-00000000000000000008"][8..12],
+            2u32.to_le_bytes()
+        );
+
+        let mut bad = run(8, 3).files();
+        bad.get_mut("snap-00000000000000000006").unwrap()[8..12]
+            .copy_from_slice(&3u32.to_le_bytes());
+        // The CRC covers the version, so a stray version is a checksum error.
+        assert!(corruption(reopen(bad)).contains("checksum"));
     }
 
     #[test]

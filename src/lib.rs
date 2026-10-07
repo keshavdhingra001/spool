@@ -27,4 +27,4 @@ pub use error::{ParseError, StoreError};
 pub use queue::{Clock, Queue, Snapshot};
 pub use reference::ReferenceQueue;
 pub use retry::QueueConfig;
-pub use types::{JobId, Lease, Millis, Payload, QueueName, Time, Token};
+pub use types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};

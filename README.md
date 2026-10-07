@@ -4,12 +4,15 @@ A distributed task queue in Rust, built from the bottom up: its own broker and s
 Postgres underneath), leases with visibility timeouts and fencing tokens, effectively-once
 processing, Raft replication written from scratch, and partition testing by deterministic simulation.
 
-**Status:** M2. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
+**Status:** M3. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
 ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state with redrive
-(M1), now durable (M2): every command goes into a checksummed write-ahead log and is synced before
+(M1). Durable (M2): every command goes into a checksummed write-ahead log and is synced before
 its result is returned, with periodic snapshots and recovery that is tested by failing at every
 storage call and recovering every state a crash could leave on disk, including a second crash during
-recovery. Networking (M3) comes next.
+recovery. Networked (M3): a TCP server with a small binary protocol and group commit (about 25x the
+throughput of one sync per command, D30), deduplication keys that survive restarts (D35), and an
+async client and worker library that heartbeats while a job runs and drops the job when its lease
+is lost (D36). Effectively-once processing (M4) comes next.
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
 ## Design in one paragraph
@@ -54,6 +57,30 @@ spool queue in /tmp/q: snapshot at LSN 0, 1 commands replayed, 0 torn bytes cut.
 > jobs
 now=0 waiting=1 leased=0 dead=0 acked=0
   job=1 queue=q attempts=0 waiting ready_at=0
+```
+
+Over the network (D30–D36): one terminal runs the server, another talks to it. Commands are the
+same, without `@<ms>`: the server stamps the time.
+
+```
+cargo run -- serve --data /tmp/q
+listening on 127.0.0.1:7878
+
+cargo run -- connect 127.0.0.1:7878
+> enqueue orders charge-card key=order-42
+enqueued job=1 queue=orders ready_at=1791415126468 key=order-42
+> enqueue orders charge-card key=order-42
+deduplicated job=1 queue=orders key=order-42
+> lease orders 30000
+leased job=1 token=1 deadline=1791415156480 attempt=1 payload=charge-card
+```
+
+From Rust, a worker is a closure (`spool::worker`):
+
+```rust
+let client = Client::connect("127.0.0.1:7878").await?;
+let worker = Worker::new(client, QueueName::new("orders")?, WorkerOptions::default());
+worker.run(|job| async move { charge(&job.payload).await }).await?;
 ```
 
 Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a

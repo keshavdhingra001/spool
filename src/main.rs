@@ -2,9 +2,17 @@
 //! after every command. `spool --data <dir>` keeps the queue in a data
 //! directory instead (M2): every command is logged and synced before its
 //! events print, and the next start recovers it.
+//!
+//! `spool serve --data <dir> [--listen <addr>]` serves the durable queue over
+//! TCP (M3); `spool connect <addr>` is a REPL against a running server, where
+//! commands are typed without `@<ms>` because the server stamps the time (D31).
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use spool::client::Client;
+use spool::server::{Server, ServerOptions};
 
 use spool::storage::FileStorage;
 use spool::{Checked, Command, Durable, Event, Options, ReferenceQueue};
@@ -40,6 +48,8 @@ impl Backend {
     }
 }
 
+const DEFAULT_LISTEN: &str = "127.0.0.1:7878";
+
 const HELP: &str = "\
 commands (every queue command starts with its logical time in ms):
   @<ms> enqueue   <queue> <payload> [delay=<ms>] [key=<key>]
@@ -57,14 +67,102 @@ commands (every queue command starts with its logical time in ms):
   help | quit
 start with `spool --data <dir>` to keep the queue on disk";
 
+const USAGE: &str = "\
+usage: spool                                   REPL, in memory
+       spool --data <dir>                      REPL, durable
+       spool serve --data <dir> [--listen <addr>]   serve over TCP (default 127.0.0.1:7878)
+       spool connect <addr>                    REPL against a server";
+
+/// Serve until Ctrl-C (exit 0) or until the queue fails (exit 1, D38).
+fn serve(dir: &Path, listen: SocketAddr) -> io::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut server = match Server::start_dir(dir, listen, ServerOptions::default()).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot serve {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        };
+        println!("listening on {}", server.local_addr());
+        io::stdout().flush()?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                let stopped = server.shutdown().await;
+                eprintln!("shut down: {:?}", stopped.stats);
+                match stopped.result {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            stopped = server.stopped() => {
+                let e = stopped.result.err().map_or("stopped".to_string(), |e| e.to_string());
+                eprintln!("fatal: {e}; restart to recover");
+                std::process::exit(1);
+            }
+        }
+    })
+}
+
+/// A REPL that sends each op to a server and prints the events it caused.
+fn connect(addr: &str) -> io::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let client = match rt.block_on(Client::connect(addr)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot connect to {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("connected to {addr}. Commands as in `help`, without `@<ms>`.");
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        match line.trim() {
+            "" => continue,
+            "quit" | "exit" => return Ok(()),
+            "help" => println!("{HELP}"),
+            input => match format!("@0 {input}").parse::<Command>() {
+                Ok(cmd) => match rt.block_on(client.request(cmd.op)) {
+                    Ok(events) if events.is_empty() => println!("(no events)"),
+                    Ok(events) => events.iter().for_each(|e| println!("{e}")),
+                    Err(e) => {
+                        println!("error: {e}");
+                        return Ok(());
+                    }
+                },
+                Err(e) => println!("error: {e}"),
+            },
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut queue = match args.as_slice() {
+        ["serve", "--data", dir] => return serve(Path::new(dir), DEFAULT_LISTEN.parse().unwrap()),
+        ["serve", "--data", dir, "--listen", addr] => match addr.parse() {
+            Ok(addr) => return serve(Path::new(dir), addr),
+            Err(e) => {
+                eprintln!("bad address {addr}: {e}");
+                std::process::exit(2);
+            }
+        },
+        ["connect", addr] => return connect(addr),
         [] => {
             println!("spool reference queue, in memory. Type `help`.");
             Backend::Memory(Checked::new())
         }
-        [flag, dir] if flag == "--data" => {
+        ["--data", dir] => {
             let dir = PathBuf::from(dir);
             match Durable::open_dir(&dir, Options::default()) {
                 Ok((d, rec)) => {
@@ -85,7 +183,7 @@ fn main() -> io::Result<()> {
             }
         }
         _ => {
-            eprintln!("usage: spool [--data <dir>]");
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };

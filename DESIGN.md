@@ -15,11 +15,15 @@ producers / workers ──TCP──> node ────────────�
                          pure, deterministic, logical time ◄─────────────────────┘
 ```
 
-Today (M1): the reference queue (D17) behind the `Queue` trait (D11): leases with visibility
+Today (M3): the reference queue (D17) behind the `Queue` trait (D11): leases with visibility
 timeouts and fencing tokens (D5, D18), retries with capped exponential backoff and deterministic
 jitter (D13) under a per-queue policy (D14), expiry counted as an attempt (D15), a dead-letter state
-with redrive (D16) and delayed jobs (D17). Time arrives in every command (D9). It is checked by two
-independent checkers (D19) over scenario files (D20) and random command sequences.
+with redrive (D16), delayed jobs (D17) and deduplication keys (D35). Time arrives in every command
+(D9). It is checked by two independent checkers (D19) over scenario files (D20) and random command
+sequences. It is durable (D21–D29): a write-ahead log of commands, synced before any result is
+returned, with snapshots and crash-tested recovery. It is served over TCP (D30–D33): one core
+thread owns the queue and commits batches with one sync, connections are tokio tasks, and the
+server stamps the time (D31). A client and worker library (D34, D36) sit on the other side.
 
 ## Decisions
 
@@ -242,7 +246,7 @@ independent checkers (D19) over scenario files (D20) and random command sequence
   wrong attempt number, a release not followed by a retry or dead-letter in the same command, a
   payload that changes between leases). The two must agree on how many jobs are in each state.
 - **Why:** the checker sees internals but trusts them; the ledger sees only output. A bug that
-  makes state and events disagree is caught by the comparison. Both run on 9 scenario files and
+  makes state and events disagree is caught by the comparison. Both run on 10 scenario files and
   on 500 random sequences of up to 300 commands per property, whose generator is checked to reach
   every event and rejection. Unit tests corrupt the state eight ways and feed the ledger eight
   impossible histories to show both actually catch something.
@@ -359,9 +363,10 @@ independent checkers (D19) over scenario files (D20) and random command sequence
 - **Alternatives:** real files and `kill -9` only; a fault-injection crate (`failpoints`).
 - **Why:** killing a real process only tests the crash points the timing happens to hit. The seam
   makes every point reachable and every run repeatable, and it is the disk the M5 simulator will
-  plug in. Run: three generated workloads of 40 commands (snapshot every 6) and the 9 scenario
-  files back to back (snapshot every 25), single commands and batches mixed: 562 failure points,
-  33,667 crash images, 136,725 second crashes inside recovery, about 11 s in a debug build. The
+  plug in. Run: three generated workloads of 40 commands with keyed and unkeyed enqueues (snapshot
+  every 6) and the 10 scenario files back to back (snapshot every 25), single commands and batches
+  mixed: 590 failure points, 38,616 crash images, 152,990 second crashes inside recovery, about
+  12 s in a debug build. The
   harness asserts it reached unacknowledged commands that survived, unsynced commands that were
   lost, torn tails and recovery from a snapshot. Its model is stated, not hidden: it does not produce garbage other than zeros inside
   unsynced data, or reorder writes within a file; the CRC covers the first and M5 can add the second.
@@ -393,6 +398,10 @@ independent checkers (D19) over scenario files (D20) and random command sequence
   builds up in the channel, so the sync cost is shared by every client waiting at that moment.
   A mutex would give the same order but one sync per request unless batching is rebuilt on top of
   it; an async task would block a runtime worker on every sync.
+- **Numbers** (`examples/group_commit.rs`, release build, 64 clients each enqueueing 100 jobs one
+  at a time, Intel 660p NVMe under btrfs, three runs): one command per sync, 1,054–1,167
+  enqueues/s; batches of up to 256, 23,758–31,820 enqueues/s, with about 32 commands per sync.
+  Roughly 25 times the throughput, entirely from sharing the sync. M11 measures latency.
 
 ### D31: Time source
 - **What:** the server's core thread stamps every command with wall-clock milliseconds since the

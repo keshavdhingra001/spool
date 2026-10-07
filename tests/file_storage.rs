@@ -1,4 +1,5 @@
-//! The real directory behind the `Storage` trait (D28, D29).
+//! The real directory behind the `Storage` trait (D28, D29), and the durable
+//! queue on top of it.
 
 use std::path::PathBuf;
 
@@ -55,4 +56,54 @@ fn one_open_per_directory() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     drop(first);
     FileStorage::open(&dir).expect("lock is released on drop");
+}
+
+#[test]
+fn durable_queue_on_real_files() {
+    use spool::{Command, Durable, Options, Queue, ReferenceQueue, Snapshot};
+
+    let dir = fresh_dir("durable_queue_on_real_files");
+    let cmds: Vec<Command> = [
+        "@0 enqueue q a",
+        "@0 enqueue q b",
+        "@1 lease q 10",
+        "@2 ack 1 1",
+        "@3 lease q 10",
+        "@20 tick",
+        "@21 enqueue r c delay=5",
+    ]
+    .iter()
+    .map(|l| l.parse().unwrap())
+    .collect();
+    let options = Options { snapshot_every: 3 };
+    {
+        let (mut d, _) = Durable::<_, ReferenceQueue>::open_dir(&dir, options).unwrap();
+        for c in &cmds {
+            d.apply(c).unwrap();
+        }
+        let second = Durable::<_, ReferenceQueue>::open_dir(&dir, options);
+        assert!(second.is_err(), "the directory is locked while open");
+    }
+    let (d, rec) = Durable::<_, ReferenceQueue>::open_dir(&dir, options).unwrap();
+    assert_eq!((rec.snapshot_lsn, rec.replayed), (6, 1));
+
+    let mut q = ReferenceQueue::new();
+    cmds.iter().for_each(|c| q.apply(c, &mut Vec::new()));
+    let (mut want, mut got) = (Vec::new(), Vec::new());
+    q.encode_state(&mut want);
+    d.queue().encode_state(&mut got);
+    assert_eq!(got, want);
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "LOCK",
+            "snap-00000000000000000006",
+            "wal-00000000000000000007"
+        ]
+    );
 }

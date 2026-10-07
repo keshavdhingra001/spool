@@ -522,3 +522,83 @@ server stamps the time (D31). A client and worker library (D34, D36) sit on the 
 - **Why:** in-process servers are fast, need no ports or cleanup, and can run the checkers inside
   the server, so every end-to-end test is also an invariant test. The binary itself is exercised by
   one smoke test.
+
+### D40: Where "effectively once" holds
+- **What:** spool promises at-least-once delivery everywhere and exactly-once *effect* inside two
+  stated boundaries. (1) Effects on state the queue owns: a job's result, recorded by a
+  transactional complete (D41) that lands exactly once per job. (2) Effects on an external store
+  that checks fencing tokens (D43) and keys each job's effect by the job, so a retry overwrites
+  instead of adding and a zombie's late write is refused. An effect outside both (an email, a
+  card charge through an API without idempotency keys) can happen more than once, and the docs
+  say so.
+- **Alternatives:** claim exactly-once without a boundary; offer only boundary (1).
+- **Why:** a worker that dies after its side effect and before its ack is indistinguishable from
+  one that died before the effect (D3), so no queue can make an arbitrary effect exactly-once.
+  What it can do is make its own state transitions atomic and hand workers a token that external
+  stores can check. Naming the boundary is what makes the claim testable (D46) and defensible.
+
+### D41: Transactional complete
+- **What:** a new op `complete <job> <token> <result>` checks the lease exactly as ack does, then
+  removes the job and stores `result` for it, in one command and so in one log record. Event:
+  `Completed { job, token }`. `result <job>` returns `Result { job, status }`, where the status is
+  `pending` (the job is still in the queue), `done` with the completing token and the payload, or
+  `unknown` (never existed, acked without a result, or the result's window ended). Results are kept
+  for 5 minutes of logical time after completion, expiring at the start of every command like
+  dedup keys (D35). A completed job counts as acked in every count and check.
+- **Alternatives:** ack, then a separate "store result" command; results in an external database.
+- **Why:** with two commands a crash between them leaves an acked job with no result or a result
+  for a job that will run again. One command is one record (D21), so recovery replays both halves
+  or neither. A producer that enqueued with a dedup key and lost the reply can retry the enqueue,
+  get the job id back (D35) and fetch the result, with the same 5-minute window on both sides.
+
+### D42: Complete is idempotent per lease
+- **What:** a `complete` for a job that is already completed, with the same token, while its
+  result is kept, answers `Completed` again and changes nothing (the result sent the second time
+  is ignored). A different token, or a job acked without a result, is rejected as before.
+- **Alternatives:** reject the retry with `unknown_job`, as a repeated ack is.
+- **Why:** the worker's problem is a lost reply: it sent `complete`, the connection dropped, and
+  it cannot tell whether the queue recorded it. With this rule it simply retries; the answer is
+  `Completed` whether the first attempt landed or not, and only the lease that won can get that
+  answer. Plain `ack` keeps its M1 behaviour because it stores nothing to compare against.
+
+### D43: Fencing downstream
+- **What:** the worker's handler receives the lease's token. `spool::fence::FencedStore` is a
+  reference store: `write(key, token, value)` succeeds only if `token` is at least the highest
+  token accepted for `key` (equal, so one lease can rewrite its own value), and remembers it. A
+  real store does the same with a conditional write, e.g. `UPDATE ... SET value = $v, token = $t
+  WHERE key = $k AND token <= $t`.
+- **Alternatives:** trust that a worker stops before its lease ends; per-job tokens.
+- **Why:** a paused worker cannot know it was paused, so only the store can refuse its late
+  write, and only by comparing something the queue issued. Tokens come from one global counter
+  (D10), so the same fence works for a resource that several different jobs write, which per-job
+  tokens could not order.
+
+### D44: Worker API for results and tokens
+- **What:** a handler returns `Result<T, E>` with `T: Into<Completion>`: `()` means ack, a
+  `Payload` means complete with that result (D41). If the complete's reply is lost, the worker
+  retries it once on a new connection (D42). The handler gets the whole lease, token included.
+- **Alternatives:** separate `run_ack` and `run_complete` loops; result passed through a channel.
+- **Why:** one loop keeps the heartbeat, cancellation and backoff logic in one place, and M3
+  handlers that return `Ok(())` keep compiling.
+
+### D45: Formats for M4
+- **What:** op tags 10 (`complete`) and 11 (`result`), event tags 13 (`completed`) and 14
+  (`result`, status 0 pending, 1 done with token and payload, 2 unknown). Snapshot version 3
+  appends the results table (`job token payload expires_at`, by job id); versions 1 and 2 still
+  load with no results. The log format is unchanged.
+- **Why:** the same rule as D35: new tags and a new snapshot version, never a changed meaning for
+  bytes already on disk.
+
+### D46: Worker-crash tests
+- **What:** a seeded test runs workers against a checked in-process server (D39) and kills them
+  at chosen points: before the effect, after the effect and before the complete, and with the
+  complete sent but its connection dropped before the reply. Others stall past their deadline and
+  come back as zombies. The test clock expires leases. Effects go to a `FencedStore` keyed by job.
+  Checks: every job is completed exactly once in the queue, with the result of the completing
+  lease; in the store, each job's value was written by the completing token; no write with a
+  token below one already accepted for that key ever succeeded; and the server's checkers pass
+  after every batch.
+- **Alternatives:** kill real worker processes.
+- **Why:** from the server's side a dead worker is a connection that stops, which an aborted
+  task produces exactly. Seeds make every interleaving repeatable, the same property the M5
+  simulator generalises.

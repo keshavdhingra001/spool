@@ -320,6 +320,11 @@ independent checkers (D19) over scenario files (D20) and random command sequence
 - **Why:** a crash can only tear the end of what was being written; anything else is disk damage or
   a bug, and starting anyway would silently drop acknowledged commands. Truncating before appending
   matters because new records written after garbage would be lost on the next recovery.
+  **Known limit:** damage to the very last record of the log looks exactly like a torn write and
+  is truncated, so that one synced command is lost silently (RocksDB's default
+  `kTolerateCorruptedTailRecords` makes the same trade). A segment header that fails its CRC with
+  nothing after it is a crash during segment creation; with records after it, it is corruption,
+  because records are only appended once the header is synced.
 
 ### D27: Snapshots
 - **What:** a snapshot is a full, canonical dump of the queue state: clock, id and token counters,

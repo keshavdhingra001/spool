@@ -26,3 +26,21 @@ pub enum ParseError {
     #[error("invalid payload `{0}` (visible ASCII, %XX escapes, `-` for empty)")]
     BadPayload(String),
 }
+
+/// Why the durable queue (M2) could not open or apply a command.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("storage: {0}")]
+    Io(#[from] std::io::Error),
+    /// The data on disk is damaged in a way a crash cannot cause (D26).
+    #[error("corrupt {file} at byte {offset}: {what}")]
+    Corruption {
+        file: String,
+        offset: u64,
+        what: String,
+    },
+    /// An earlier storage error left the in-memory state possibly ahead of the
+    /// disk (D25). Reopen the directory to recover.
+    #[error("an earlier storage error poisoned this queue; reopen it to recover")]
+    Poisoned,
+}

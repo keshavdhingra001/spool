@@ -17,10 +17,11 @@ pub mod retry;
 pub mod scenario;
 pub mod storage;
 pub mod types;
+pub mod wal;
 
 pub use check::Checked;
 pub use command::{Command, Event, Op, RejectReason, ReleaseReason};
-pub use error::ParseError;
+pub use error::{ParseError, StoreError};
 pub use queue::{Clock, Queue, Snapshot};
 pub use reference::ReferenceQueue;
 pub use retry::QueueConfig;

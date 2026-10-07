@@ -155,7 +155,9 @@ async fn backpressure_does_not_deadlock() {
         ServerOptions {
             in_flight: 2,
             core_queue: 3,
-            max_batch: 4,
+            // Below what the channel can hand over at once (1 + 3), so the
+            // cap itself is what keeps batches small.
+            max_batch: 2,
             ..options(&clock)
         },
     )
@@ -177,7 +179,7 @@ async fn backpressure_does_not_deadlock() {
     drop(c);
     let stopped = server.shutdown().await;
     stopped.result.unwrap();
-    assert!(stopped.stats.largest_batch <= 4);
+    assert!(stopped.stats.largest_batch <= 2, "{:?}", stopped.stats);
 }
 
 #[tokio::test]

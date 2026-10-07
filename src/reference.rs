@@ -793,8 +793,12 @@ mod tests {
             q
         };
         type Corrupt = fn(&mut ReferenceQueue);
-        let corruptions: [(&str, Corrupt); 5] = [
+        let corruptions: [(&str, Corrupt); 6] = [
             ("lost expiry index", |q| q.dedup_expiry.clear()),
+            ("orphan expiry entry", |q| {
+                let k = (QueueName::new("b").unwrap(), DedupKey::new("j").unwrap());
+                q.dedup_expiry.insert((Time(9), k.0, k.1));
+            }),
             ("extra expiry entry", |q| {
                 let (k, _) = q.dedup.pop_first().unwrap();
                 q.dedup_expiry.insert((Time(9), k.0, k.1));

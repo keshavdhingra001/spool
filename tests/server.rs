@@ -159,6 +159,8 @@ async fn pipelined_requests_are_answered_in_order() {
     stopped.result.unwrap();
     assert_eq!(stopped.stats.commands, 300);
     assert!(stopped.stats.batches <= 300);
+    // Both checkers ran after every batch (D39).
+    assert_eq!(stopped.stats.checked, stopped.stats.batches);
     eprintln!("{:?}", stopped.stats);
 }
 

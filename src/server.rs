@@ -119,6 +119,8 @@ pub struct Stats {
     pub batches: u64,
     pub commands: u64,
     pub largest_batch: usize,
+    /// Batches after which both checkers ran (all of them with `check`).
+    pub checked: u64,
 }
 
 /// How the core thread ended: the storage it owned (so a test can restart on
@@ -246,6 +248,7 @@ fn core<S: Storage>(
         {
             break Err(ServerError::Invariant(e));
         }
+        stats.checked += u64::from(options.check);
         for (job, events) in batch.drain(..).zip(events) {
             // The client may have gone; its reply has nowhere to go.
             let _ = job.reply.send(events);
@@ -328,11 +331,11 @@ async fn connection(
                     Err(_) => break,
                 },
             };
-            let last = matches!(reply, Reply::Error { .. });
             buf.clear();
             protocol::encode_reply(id, &reply, &mut buf);
-            // More replies already done are written in the same syscall.
-            if protocol::write_all(&mut wr, &buf).await.is_err() || last {
+            // After an error reply the reader stops and drops `pending`, so
+            // this loop ends and the socket closes once the error is written.
+            if protocol::write_all(&mut wr, &buf).await.is_err() {
                 break;
             }
         }

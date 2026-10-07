@@ -249,7 +249,7 @@ stores (D43), tested against seeded worker crashes and zombies (D46).
   wrong attempt number, a release not followed by a retry or dead-letter in the same command, a
   payload that changes between leases). The two must agree on how many jobs are in each state.
 - **Why:** the checker sees internals but trusts them; the ledger sees only output. A bug that
-  makes state and events disagree is caught by the comparison. Both run on 10 scenario files and
+  makes state and events disagree is caught by the comparison. Both run on 11 scenario files and
   on 500 random sequences of up to 300 commands per property, whose generator is checked to reach
   every event and rejection. Unit tests corrupt the state eight ways and feed the ledger eight
   impossible histories to show both actually catch something.
@@ -366,10 +366,10 @@ stores (D43), tested against seeded worker crashes and zombies (D46).
 - **Alternatives:** real files and `kill -9` only; a fault-injection crate (`failpoints`).
 - **Why:** killing a real process only tests the crash points the timing happens to hit. The seam
   makes every point reachable and every run repeatable, and it is the disk the M5 simulator will
-  plug in. Run: three generated workloads of 40 commands with keyed and unkeyed enqueues (snapshot
-  every 6) and the 10 scenario files back to back (snapshot every 25), single commands and batches
-  mixed: 590 failure points, 38,616 crash images, 152,990 second crashes inside recovery, about
-  12 s in a debug build. The
+  plug in. Run: three generated workloads of 40 commands with keyed and unkeyed enqueues, completes
+  and result queries (snapshot every 6) and the 11 scenario files back to back (snapshot every 25),
+  single commands and batches mixed: 636 failure points, 43,525 crash images, 169,015 second
+  crashes inside recovery, about 15 s in a debug build. The
   harness asserts it reached unacknowledged commands that survived, unsynced commands that were
   lost, torn tails and recovery from a snapshot. Its model is stated, not hidden: it does not produce garbage other than zeros inside
   unsynced data, or reorder writes within a file; the CRC covers the first and M5 can add the second.

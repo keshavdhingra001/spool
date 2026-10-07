@@ -254,3 +254,118 @@ independent checkers (D19) over scenario files (D20) and random command sequence
 - **Why:** each file reads as a story about one rule (the zombie worker, the poison job, the
   expiry boundary) and doubles as documentation. Expected events were recorded from the queue and
   then checked line by line against the rules, including the jitter bands.
+
+### D21: The write-ahead log holds commands
+- **What:** every command is written to the log, including rejected ones and ticks (both move the
+  clock and can expire leases). Recovery replays the commands through `apply` (D4) and reaches the
+  same state. Events are never stored; they are recomputed.
+- **Alternatives:** log the events, or the state changes each command made (redo records).
+- **Why:** the command is the smallest complete description of a step, and replay is free because
+  the queue is deterministic. It is also exactly what the Raft log will carry in M7, where
+  replicas apply committed commands, so the WAL format becomes the replication format. The cost:
+  recovery re-executes every command since the last snapshot, and any change to `apply` that
+  alters what an old command does is a format change (an old log must replay to the old state).
+
+### D22: Durable before visible
+- **What:** a command's events are returned only after its log record is synced. Order inside
+  `apply`: apply in memory, append the record, sync, return the events. Nothing reaches a caller
+  between the in-memory apply and the sync.
+- **Alternatives:** reply first and sync in the background (Redis `appendfsync everysec`).
+- **Why:** a worker that saw `acked` or a producer that saw `enqueued` must never find the job
+  missing or un-acked after a crash. Applying before writing is safe because nobody can observe the
+  new state until the sync succeeds, and if the write fails the handle is poisoned (D25) so the
+  in-memory state that ran ahead of the disk is thrown away.
+
+### D23: Log record framing
+- **What:** a segment file starts with a 24-byte header (`SPOOLWAL`, format version `u32`, first
+  LSN `u64`, CRC-32C of those 20 bytes). Each record is `[len u32][crc u32][lsn u64][body]`,
+  little-endian, with CRC-32C over `len`, `lsn` and `body`. LSNs start at 1 and must be
+  consecutive across all segments; a segment's file name carries its first LSN.
+- **Alternatives:** lsmkv's `[crc][kind][lens][data]` with no sequence number; LevelDB's 32 KiB
+  blocks with fragmented records.
+- **Why:** covering `len` with the CRC means a flipped length bit is caught instead of silently
+  splitting the log at the wrong place. The LSN ties records to snapshots (replay starts after the
+  snapshot's LSN) and catches a missing or duplicated record, which a per-record CRC cannot.
+  CRC-32C has hardware support on x86 and ARM. **Known limit (as lsmkv D2):** a corrupted length
+  that points past the end of the file looks like a torn tail and is truncated. Fixed-size blocks
+  would close that; not worth it before M11 measures the log.
+
+### D24: Binary command encoding
+- **What:** a hand-written little-endian codec: `at u64`, a one-byte op tag, then the fields in
+  declaration order; queue names as `u8` length + bytes (validated on decode), payloads as `u32`
+  length + bytes. Decoding must consume the whole body. The same codec will carry commands in the
+  M3 wire protocol.
+- **Alternatives:** the D12 text format; serde + bincode.
+- **Why:** the format is part of the on-disk contract, so it is written down in one file and pinned
+  by a golden-bytes test rather than delegated to a library whose encoding can change between
+  versions. Text would work but costs parsing on every replay and needs escaping for payloads.
+
+### D25: Sync policy and poisoning
+- **What:** the log API is `append(commands)` then `sync()` (`fdatasync`). `Durable::apply` syncs
+  every command; `apply_batch` appends several and syncs once (the group-commit shape; M11 measures
+  it). Any storage error poisons the handle: every later call returns `Poisoned`, and the only way
+  back is to reopen, which recovers from whatever reached the disk.
+- **Alternatives:** sync on a timer (loses the last interval on a crash); retry a failed sync.
+- **Why:** after a failed `fsync` the kernel may have dropped the dirty pages and cleared the error
+  (PostgreSQL's 2018 "fsyncgate"), so retrying can report success for data that is gone. The
+  in-memory state may also be ahead of the disk (D22). Poisoning on every error, not just sync,
+  keeps one rule to explain; reopening is the single recovery path and is tested at every byte.
+
+### D26: Torn tails and corruption
+- **What:** as lsmkv D2. Reading stops at the first record that is short, has a bad CRC or a length
+  past the end. If that record is in the last segment and is followed only by its own bytes or by
+  zeros, it is a torn tail: the segment is truncated there and synced before new records go after
+  it. A bad record with non-zero data after it, a bad record in an earlier segment, an LSN gap or a
+  body that fails to decode is `Corruption` and the queue refuses to open.
+- **Why:** a crash can only tear the end of what was being written; anything else is disk damage or
+  a bug, and starting anyway would silently drop acknowledged commands. Truncating before appending
+  matters because new records written after garbage would be lost on the next recovery.
+
+### D27: Snapshots
+- **What:** a snapshot is a full, canonical dump of the queue state: clock, id and token counters,
+  acked count, every queue's config in name order, every live job in id order (the indexes are
+  rebuilt from the jobs and then checked with `check_invariants`). File `snap-<lsn>`: `SPOOLSNP`,
+  version, the LSN of the last command it includes, body length, CRC-32C over header and body.
+  Written as `snap-<lsn>.tmp`, synced, renamed, directory synced. Then a new log segment starts at
+  `lsn + 1` and older snapshots and segments are deleted. Taken every `snapshot_every` commands
+  (a count, never a timer, so it is deterministic).
+- **Alternatives:** no snapshots (replay the whole log forever); incremental or copy-on-write
+  snapshots; a snapshot timer.
+- **Why:** recovery time and disk use stay bounded by `snapshot_every`. A full dump is the simplest
+  thing that is obviously correct at M2 sizes; incremental snapshots come with Raft log compaction
+  (Tier 3). Because the encoding is canonical, two queues are in the same state exactly when their
+  snapshots are byte-equal, which the crash tests use as their equality check. The `HashMap` of
+  jobs is sorted by id before writing, so its iteration order never reaches the file (D4).
+
+### D28: Storage seam and crash testing
+- **What:** all file access goes through a `Storage` trait (list, read, create, append, sync,
+  truncate, rename, remove, sync the directory). `FileStorage` is the real one. `MemStorage` keeps
+  synced and unsynced bytes apart, and directory changes apart from the synced directory. Its crash
+  images are: the synced directory or the current one, with every file at its synced length, plus
+  for each file with unsynced bytes, every prefix of them and an all-zero tail of the same length.
+  `fail_after(n)` makes the `n+1`-th mutating call fail (an append that fails still leaves its bytes
+  unsynced, so a partial write is one of the images). The harness runs a workload, fails it at
+  every storage call, recovers every crash image, and checks: recovery succeeds; the state equals a
+  replay of `k` commands where every command whose events were returned is included and nothing
+  beyond the failed command is; the invariant checker passes; the log accepts new commands that
+  survive the next reopen; and a second crash during recovery, at every call, recovers to the same
+  state as the first recovery.
+- **Alternatives:** real files and `kill -9` only; a fault-injection crate (`failpoints`).
+- **Why:** killing a real process only tests the crash points the timing happens to hit. The seam
+  makes every point reachable and every run repeatable, and it is the disk the M5 simulator will
+  plug in. Its model is stated, not hidden: it does not produce garbage other than zeros inside
+  unsynced data, or reorder writes within a file; the CRC covers the first and M5 can add the second.
+
+### D29: Recovery and directory layout
+- **What:** a data directory holds `snap-<lsn>`, `wal-<first lsn>` segments (LSNs zero-padded to 20
+  digits so names sort) and `LOCK`, held with an exclusive `flock` so only one process opens it.
+  Recovery: delete `*.tmp`; load the newest snapshot (none means an empty queue at LSN 0); find the
+  segment containing the next LSN and ignore older ones (left over from a crash before cleanup);
+  replay records after the snapshot's LSN, checking continuity; truncate a torn tail; reopen the
+  last segment for appending, or start a new one. `Durable<S, Q>` wraps any state machine with a
+  snapshot codec; its `apply` returns `Result<&[Event], StoreError>`.
+- **Alternatives:** one ever-growing log file; no lock; `Durable` implementing the `Queue` trait.
+- **Why:** segments let a snapshot free disk by deleting whole files instead of rewriting a log.
+  The lock closes the gap lsmkv D7 left open: two processes appending to one log interleave
+  records and corrupt it. `Durable` cannot implement `Queue` because `Queue::apply` has no way to
+  report a disk error, and swallowing it would break D22.

@@ -1,7 +1,9 @@
-//! Property test for the text format (D12): every command prints as a line that
-//! parses back to the same command.
+//! Property tests for both command encodings: every command prints as a text
+//! line that parses back to the same command (D12), and encodes to bytes that
+//! decode back to it (D24).
 
 use proptest::prelude::*;
+use spool::codec::{decode_command, encode_command};
 use spool::{Command, JobId, Millis, Op, Payload, QueueConfig, QueueName, Time, Token};
 
 fn queue() -> impl Strategy<Value = QueueName> {
@@ -55,6 +57,14 @@ proptest! {
         let line = cmd.to_string();
         prop_assert!(!line.contains('\n'), "one command per line: {line:?}");
         prop_assert_eq!(line.parse::<Command>(), Ok(cmd));
+    }
+
+    #[test]
+    fn binary_round_trips(at in any::<u64>(), op in op()) {
+        let cmd = Command { at: Time(at), op };
+        let mut bytes = Vec::new();
+        encode_command(&cmd, &mut bytes);
+        prop_assert_eq!(decode_command(&bytes), Ok(cmd));
     }
 
     #[test]

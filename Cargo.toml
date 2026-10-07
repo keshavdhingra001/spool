@@ -6,6 +6,7 @@ description = "A distributed task queue: own broker, leases with fencing tokens,
 license = "MIT"
 
 [dependencies]
+crc32c = "0.6"
 thiserror = "2"
 
 [dev-dependencies]

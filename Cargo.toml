@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 crc32c = "0.6"
 thiserror = "2"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }

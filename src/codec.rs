@@ -21,13 +21,32 @@
 //! A keyed enqueue has its own tag so that every log written before keys
 //! existed decodes unchanged (D35).
 //!
+//! Events, for replies on the wire (D33), in the same style:
+//!
+//! ```text
+//! events        = count:u32 event*
+//! enqueued  (1) = job:u64 queue ready_at:u64 has_key:u8 [key]
+//! leased    (2) = job:u64 token:u64 deadline:u64 attempt:u32 payload
+//! empty     (3) = queue
+//! renewed   (4) = job:u64 token:u64 deadline:u64
+//! acked     (5) = job:u64
+//! released  (6) = job:u64 token:u64 reason:u8        (1 nack, 2 expired)
+//! retrying  (7) = job:u64 ready_at:u64
+//! dead      (8) = job:u64
+//! redriven  (9) = job:u64
+//! configured (10) = queue max_attempts:u32 backoff_base:u64 backoff_cap:u64
+//! rejected (11) = reason:u8      (1 unknown_job, 2 not_leased, 3 stale_token,
+//!                                 4 zero_visibility, 5 bad_config)
+//! deduplicated (12) = job:u64 queue key
+//! ```
+//!
 //! Tag 0 is never used, so a run of zero bytes never decodes as a command.
 
 use thiserror::Error;
 
-use crate::command::{Command, Op};
+use crate::command::{Command, Event, Op, RejectReason, ReleaseReason};
 use crate::retry::QueueConfig;
-use crate::types::{DedupKey, JobId, Millis, Payload, QueueName, Time, Token};
+use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};
 
 /// Bytes that are not a valid encoding.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -181,6 +200,223 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         tag => return Err(DecodeError::UnknownTag { what: "op", tag }),
     };
     Ok(op)
+}
+
+const ENQUEUED: u8 = 1;
+const LEASED: u8 = 2;
+const EMPTY: u8 = 3;
+const RENEWED: u8 = 4;
+const ACKED: u8 = 5;
+const RELEASED: u8 = 6;
+const RETRYING: u8 = 7;
+const DEAD: u8 = 8;
+const REDRIVEN: u8 = 9;
+const CONFIGURED: u8 = 10;
+const REJECTED: u8 = 11;
+const DEDUPLICATED: u8 = 12;
+
+/// Append `events`, with their count, to `out` (D33).
+pub fn encode_events(events: &[Event], out: &mut Vec<u8>) {
+    put_u32(out, u32::try_from(events.len()).expect("under 2^32 events"));
+    for e in events {
+        encode_event(e, out);
+    }
+}
+
+/// Decode exactly one `encode_events` output; `bytes` must hold nothing else.
+pub fn decode_events(bytes: &[u8]) -> Result<Vec<Event>, DecodeError> {
+    let mut r = Reader::new(bytes);
+    let n = r.u32()?;
+    // Every event is at least 2 bytes, so a count the input cannot hold is
+    // refused before it sizes an allocation.
+    if n as usize > bytes.len() / 2 {
+        return Err(DecodeError::Truncated);
+    }
+    let mut events = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        events.push(read_event(&mut r)?);
+    }
+    r.finish()?;
+    Ok(events)
+}
+
+pub fn encode_event(e: &Event, out: &mut Vec<u8>) {
+    let lease = |out: &mut Vec<u8>, l: &Lease| {
+        put_u64(out, l.job.0);
+        put_u64(out, l.token.0);
+        put_u64(out, l.deadline.0);
+    };
+    match e {
+        Event::Enqueued {
+            job,
+            queue,
+            ready_at,
+            key,
+        } => {
+            out.push(ENQUEUED);
+            put_u64(out, job.0);
+            put_name(out, queue);
+            put_u64(out, ready_at.0);
+            match key {
+                None => out.push(0),
+                Some(key) => {
+                    out.push(1);
+                    put_key(out, key);
+                }
+            }
+        }
+        Event::Leased {
+            lease: l,
+            attempt,
+            payload,
+        } => {
+            out.push(LEASED);
+            lease(out, l);
+            put_u32(out, *attempt);
+            put_payload(out, payload);
+        }
+        Event::Empty { queue } => {
+            out.push(EMPTY);
+            put_name(out, queue);
+        }
+        Event::Renewed { lease: l } => {
+            out.push(RENEWED);
+            lease(out, l);
+        }
+        Event::Acked { job } => {
+            out.push(ACKED);
+            put_u64(out, job.0);
+        }
+        Event::Released { job, token, reason } => {
+            out.push(RELEASED);
+            put_u64(out, job.0);
+            put_u64(out, token.0);
+            out.push(match reason {
+                ReleaseReason::Nack => 1,
+                ReleaseReason::Expired => 2,
+            });
+        }
+        Event::Retrying { job, ready_at } => {
+            out.push(RETRYING);
+            put_u64(out, job.0);
+            put_u64(out, ready_at.0);
+        }
+        Event::DeadLettered { job } => {
+            out.push(DEAD);
+            put_u64(out, job.0);
+        }
+        Event::Redriven { job } => {
+            out.push(REDRIVEN);
+            put_u64(out, job.0);
+        }
+        Event::Configured { queue, config } => {
+            out.push(CONFIGURED);
+            put_name(out, queue);
+            put_config(out, config);
+        }
+        Event::Rejected { reason } => {
+            out.push(REJECTED);
+            out.push(match reason {
+                RejectReason::UnknownJob => 1,
+                RejectReason::NotLeased => 2,
+                RejectReason::StaleToken => 3,
+                RejectReason::ZeroVisibility => 4,
+                RejectReason::BadConfig => 5,
+            });
+        }
+        Event::Deduplicated { job, queue, key } => {
+            out.push(DEDUPLICATED);
+            put_u64(out, job.0);
+            put_name(out, queue);
+            put_key(out, key);
+        }
+    }
+}
+
+fn read_event(r: &mut Reader) -> Result<Event, DecodeError> {
+    let lease = |r: &mut Reader| -> Result<Lease, DecodeError> {
+        Ok(Lease {
+            job: JobId(r.u64()?),
+            token: Token(r.u64()?),
+            deadline: Time(r.u64()?),
+        })
+    };
+    Ok(match r.u8()? {
+        ENQUEUED => Event::Enqueued {
+            job: JobId(r.u64()?),
+            queue: r.name()?,
+            ready_at: Time(r.u64()?),
+            key: match r.u8()? {
+                0 => None,
+                1 => Some(r.key()?),
+                tag => {
+                    return Err(DecodeError::UnknownTag {
+                        what: "key flag",
+                        tag,
+                    });
+                }
+            },
+        },
+        LEASED => Event::Leased {
+            lease: lease(r)?,
+            attempt: r.u32()?,
+            payload: r.payload()?,
+        },
+        EMPTY => Event::Empty { queue: r.name()? },
+        RENEWED => Event::Renewed { lease: lease(r)? },
+        ACKED => Event::Acked {
+            job: JobId(r.u64()?),
+        },
+        RELEASED => Event::Released {
+            job: JobId(r.u64()?),
+            token: Token(r.u64()?),
+            reason: match r.u8()? {
+                1 => ReleaseReason::Nack,
+                2 => ReleaseReason::Expired,
+                tag => {
+                    return Err(DecodeError::UnknownTag {
+                        what: "release reason",
+                        tag,
+                    });
+                }
+            },
+        },
+        RETRYING => Event::Retrying {
+            job: JobId(r.u64()?),
+            ready_at: Time(r.u64()?),
+        },
+        DEAD => Event::DeadLettered {
+            job: JobId(r.u64()?),
+        },
+        REDRIVEN => Event::Redriven {
+            job: JobId(r.u64()?),
+        },
+        CONFIGURED => Event::Configured {
+            queue: r.name()?,
+            config: r.config()?,
+        },
+        REJECTED => Event::Rejected {
+            reason: match r.u8()? {
+                1 => RejectReason::UnknownJob,
+                2 => RejectReason::NotLeased,
+                3 => RejectReason::StaleToken,
+                4 => RejectReason::ZeroVisibility,
+                5 => RejectReason::BadConfig,
+                tag => {
+                    return Err(DecodeError::UnknownTag {
+                        what: "reject reason",
+                        tag,
+                    });
+                }
+            },
+        },
+        DEDUPLICATED => Event::Deduplicated {
+            job: JobId(r.u64()?),
+            queue: r.name()?,
+            key: r.key()?,
+        },
+        tag => return Err(DecodeError::UnknownTag { what: "event", tag }),
+    })
 }
 
 pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -345,6 +581,84 @@ mod tests {
                 b'7', // key "k7"
             ]
         );
+    }
+
+    #[test]
+    fn event_golden_bytes() {
+        // Pinned: changing these bytes breaks every client (D33).
+        let mut out = Vec::new();
+        encode_events(
+            &[
+                Event::Acked { job: JobId(258) },
+                Event::Rejected {
+                    reason: RejectReason::StaleToken,
+                },
+                Event::Enqueued {
+                    job: JobId(1),
+                    queue: QueueName::new("q").unwrap(),
+                    ready_at: Time(2),
+                    key: Some(DedupKey::new("k").unwrap()),
+                },
+            ],
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            [
+                3, 0, 0, 0, // 3 events
+                ACKED, 2, 1, 0, 0, 0, 0, 0, 0, // acked job 258
+                REJECTED, 3, // stale_token
+                ENQUEUED, 1, 0, 0, 0, 0, 0, 0, 0, // job 1
+                1, b'q', // queue "q"
+                2, 0, 0, 0, 0, 0, 0, 0, // ready_at 2
+                1, 1, b'k', // key "k"
+            ]
+        );
+        assert_eq!(decode_events(&out).unwrap().len(), 3);
+        for len in 0..out.len() {
+            assert_eq!(
+                decode_events(&out[..len]),
+                Err(DecodeError::Truncated),
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn events_reject_bad_input() {
+        let one = |e: Event| {
+            let mut out = Vec::new();
+            encode_events(&[e], &mut out);
+            out
+        };
+        let mut bytes = one(Event::Acked { job: JobId(1) });
+        bytes[4] = 0;
+        assert_eq!(
+            decode_events(&bytes),
+            Err(DecodeError::UnknownTag {
+                what: "event",
+                tag: 0
+            })
+        );
+        let mut bytes = one(Event::Rejected {
+            reason: RejectReason::BadConfig,
+        });
+        bytes[5] = 6;
+        assert_eq!(
+            decode_events(&bytes),
+            Err(DecodeError::UnknownTag {
+                what: "reject reason",
+                tag: 6
+            })
+        );
+        // A count the input cannot possibly hold, without allocating for it.
+        assert_eq!(
+            decode_events(&[255, 255, 255, 255]),
+            Err(DecodeError::Truncated)
+        );
+        let mut bytes = one(Event::Acked { job: JobId(1) });
+        bytes.push(9);
+        assert_eq!(decode_events(&bytes), Err(DecodeError::TrailingBytes(1)));
     }
 
     #[test]

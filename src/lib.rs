@@ -12,6 +12,7 @@ pub mod command;
 pub mod durable;
 pub mod error;
 pub mod ledger;
+pub mod protocol;
 pub mod queue;
 pub mod reference;
 pub mod retry;

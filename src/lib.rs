@@ -20,7 +20,7 @@ pub mod types;
 pub use check::Checked;
 pub use command::{Command, Event, Op, RejectReason, ReleaseReason};
 pub use error::ParseError;
-pub use queue::{Clock, Queue};
+pub use queue::{Clock, Queue, Snapshot};
 pub use reference::ReferenceQueue;
 pub use retry::QueueConfig;
 pub use types::{JobId, Lease, Millis, Payload, QueueName, Time, Token};

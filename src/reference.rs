@@ -14,8 +14,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
+use crate::codec::{self, DecodeError, Reader};
 use crate::command::{Command, Event, Op, RejectReason, ReleaseReason};
-use crate::queue::{Clock, Queue};
+use crate::queue::{Clock, Queue, Snapshot};
 use crate::retry::QueueConfig;
 use crate::types::{JobId, Lease, Millis, Payload, QueueName, Time, Token};
 
@@ -417,6 +418,144 @@ impl ReferenceQueue {
     }
 }
 
+const WAITING: u8 = 1;
+const LEASED: u8 = 2;
+const DEAD: u8 = 3;
+
+/// Snapshot body (D27), little-endian, using the codec's field encodings (D24):
+///
+/// ```text
+/// now:u64 last_job:u64 last_token:u64 acked:u64
+/// queue_count:u32 { name config }            in name order
+/// job_count:u64   { id:u64 name payload attempts:u32 state }   in id order
+/// state = 1 ready_at:u64 | 2 token:u64 deadline:u64 | 3
+/// ```
+///
+/// The indexes are not stored: they are rebuilt from the jobs.
+impl Snapshot for ReferenceQueue {
+    fn encode_state(&self, out: &mut Vec<u8>) {
+        codec::put_u64(out, self.clock.now().0);
+        codec::put_u64(out, self.last_job);
+        codec::put_u64(out, self.last_token);
+        codec::put_u64(out, self.acked);
+        let queues = u32::try_from(self.queues.len()).expect("under 2^32 queues");
+        codec::put_u32(out, queues);
+        for (name, q) in &self.queues {
+            codec::put_name(out, name);
+            codec::put_config(out, &q.config);
+        }
+        // Sorted, so the HashMap's iteration order never reaches the bytes (D4).
+        let mut ids: Vec<JobId> = self.jobs.keys().copied().collect();
+        ids.sort();
+        codec::put_u64(out, ids.len() as u64);
+        for id in ids {
+            let job = &self.jobs[&id];
+            codec::put_u64(out, id.0);
+            codec::put_name(out, &job.queue);
+            codec::put_payload(out, &job.payload);
+            codec::put_u32(out, job.attempts);
+            match job.state {
+                JobState::Waiting { ready_at } => {
+                    out.push(WAITING);
+                    codec::put_u64(out, ready_at.0);
+                }
+                JobState::Leased { token, deadline } => {
+                    out.push(LEASED);
+                    codec::put_u64(out, token.0);
+                    codec::put_u64(out, deadline.0);
+                }
+                JobState::Dead => out.push(DEAD),
+            }
+        }
+    }
+
+    fn decode_state(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let mut clock = Clock::default();
+        clock.advance(Time(r.u64()?));
+        let mut q = ReferenceQueue {
+            clock,
+            last_job: r.u64()?,
+            last_token: r.u64()?,
+            acked: r.u64()?,
+            ..Self::default()
+        };
+        let invalid = |what: String| DecodeError::Invalid(format!("snapshot: {what}"));
+        let mut prev: Option<QueueName> = None;
+        for _ in 0..r.u32()? {
+            let name = r.name()?;
+            if prev.as_ref().is_some_and(|p| *p >= name) {
+                return Err(invalid(format!("queue {name} out of order")));
+            }
+            let config = r.config()?;
+            q.queues.insert(
+                name.clone(),
+                QueueState {
+                    config,
+                    ..QueueState::default()
+                },
+            );
+            prev = Some(name);
+        }
+        let mut prev_id = JobId(0);
+        for _ in 0..r.u64()? {
+            let id = JobId(r.u64()?);
+            if id <= prev_id {
+                return Err(invalid(format!("job {id} out of order")));
+            }
+            prev_id = id;
+            let queue = r.name()?;
+            let payload = r.payload()?;
+            let attempts = r.u32()?;
+            let state = match r.u8()? {
+                WAITING => JobState::Waiting {
+                    ready_at: Time(r.u64()?),
+                },
+                LEASED => JobState::Leased {
+                    token: Token(r.u64()?),
+                    deadline: Time(r.u64()?),
+                },
+                DEAD => JobState::Dead,
+                tag => {
+                    return Err(DecodeError::UnknownTag {
+                        what: "job state",
+                        tag,
+                    });
+                }
+            };
+            let qs = q
+                .queues
+                .get_mut(&queue)
+                .ok_or_else(|| invalid(format!("job {id}: unknown queue {queue}")))?;
+            match state {
+                JobState::Waiting { ready_at } => {
+                    qs.waiting.insert((ready_at, id));
+                }
+                JobState::Leased { deadline, .. } => {
+                    q.leases.insert((deadline, id));
+                }
+                JobState::Dead => {
+                    qs.dead.insert(id);
+                }
+            }
+            q.jobs.insert(
+                id,
+                Job {
+                    queue,
+                    payload,
+                    attempts,
+                    state,
+                },
+            );
+        }
+        r.finish()?;
+        // Everything else a valid state must satisfy (D19): ids and tokens
+        // issued, nothing lost, no lease past its deadline, valid configs.
+        q.check_invariants().map_err(invalid)?;
+        Ok(q)
+    }
+}
+
 fn reject(reason: RejectReason, out: &mut Vec<Event>) {
     out.push(Event::Rejected { reason });
 }
@@ -547,5 +686,108 @@ mod tests {
             corrupt(&mut q);
             assert!(q.check_invariants().is_err(), "{name} not detected");
         }
+    }
+
+    fn snapshot(q: &ReferenceQueue) -> Vec<u8> {
+        let mut out = Vec::new();
+        q.encode_state(&mut out);
+        out
+    }
+
+    #[test]
+    fn snapshot_round_trips_every_state() {
+        let mut q = queue_with_lease();
+        // Job 2 becomes dead, a third job waits with a delay, queue b is empty.
+        run(
+            &mut q,
+            &[
+                "@1 configure a 1 0 0",
+                "@1 lease a 10",
+                "@1 nack 2 2",
+                "@1 enqueue a z delay=50",
+                "@1 configure b 2 5 9",
+            ],
+        );
+        let c = q.counts();
+        assert_eq!((c.waiting, c.leased, c.dead), (1, 1, 1));
+        let bytes = snapshot(&q);
+        let back = ReferenceQueue::decode_state(&bytes).unwrap();
+        assert_eq!(snapshot(&back), bytes);
+        assert_eq!(back.jobs(), q.jobs());
+        assert_eq!(back.counts(), q.counts());
+        assert_eq!(back.now(), q.now());
+        // The rebuilt indexes behave like the originals.
+        let more = [
+            "@2 lease a 10",
+            "@20 redrive a",
+            "@20 lease a 5",
+            "@60 tick",
+        ];
+        let (mut a, mut b) = (q, back);
+        assert_eq!(run(&mut a, &more), run(&mut b, &more));
+        assert_eq!(snapshot(&a), snapshot(&b));
+    }
+
+    #[test]
+    fn snapshot_decode_refuses_invalid_states() {
+        let bytes = snapshot(&queue_with_lease());
+        for len in 0..bytes.len() {
+            assert!(
+                ReferenceQueue::decode_state(&bytes[..len]).is_err(),
+                "{len}"
+            );
+        }
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(
+            ReferenceQueue::decode_state(&long).unwrap_err(),
+            DecodeError::TrailingBytes(1)
+        );
+        // States whose bytes parse but break an invariant (D19).
+        type Corrupt = fn(&mut ReferenceQueue);
+        let corruptions: [(&str, Corrupt); 5] = [
+            ("lost job", |q| {
+                q.jobs.remove(&JobId(2));
+            }),
+            ("token from the future", |q| q.last_token = 0),
+            ("lease at its deadline", |q| {
+                q.clock.advance(Time(11));
+            }),
+            ("bad config", |q| {
+                let qs = q.queues.get_mut(&QueueName::new("a").unwrap()).unwrap();
+                qs.config.max_attempts = 0;
+            }),
+            ("job in a queue that does not exist", |q| {
+                q.queues.clear();
+            }),
+        ];
+        for (name, corrupt) in corruptions {
+            let mut q = queue_with_lease();
+            corrupt(&mut q);
+            let err = ReferenceQueue::decode_state(&snapshot(&q));
+            assert!(
+                matches!(err, Err(DecodeError::Invalid(_))),
+                "{name}: {err:?}"
+            );
+        }
+        // Jobs must be in strictly increasing id order (header 36 bytes, queue
+        // "a" 22 bytes, job count 8 bytes, then job 1's id).
+        let mut swapped = bytes.clone();
+        swapped[66] = 7;
+        assert!(matches!(
+            ReferenceQueue::decode_state(&swapped),
+            Err(DecodeError::Invalid(m)) if m.contains("out of order")
+        ));
+        let mut bad_tag = bytes;
+        let job1_state = 66 + 8 + 2 + 5 + 4;
+        assert_eq!(bad_tag[job1_state], LEASED);
+        bad_tag[job1_state] = 9;
+        assert_eq!(
+            ReferenceQueue::decode_state(&bad_tag).unwrap_err(),
+            DecodeError::UnknownTag {
+                what: "job state",
+                tag: 9
+            }
+        );
     }
 }

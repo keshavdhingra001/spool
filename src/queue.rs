@@ -2,6 +2,7 @@
 //! (simple, obviously correct, kept forever as the oracle); later milestones wrap
 //! it in a log (M2) and in Raft (M7) without changing this trait.
 
+use crate::codec::DecodeError;
 use crate::command::{Command, Event};
 use crate::types::Time;
 
@@ -14,6 +15,18 @@ pub trait Queue {
 
     /// The queue's logical clock: the largest command time seen so far (D9).
     fn now(&self) -> Time;
+}
+
+/// A queue whose whole state can be written out and read back (D27), so the
+/// durable wrapper (M2) can snapshot it instead of replaying the log forever.
+pub trait Snapshot: Queue + Default + Sized {
+    /// Append the state's canonical encoding to `out`: two queues are in the
+    /// same state exactly when their encodings are equal.
+    fn encode_state(&self, out: &mut Vec<u8>);
+
+    /// Rebuild a queue from `encode_state`'s output, refusing bytes that do not
+    /// describe a valid state.
+    fn decode_state(bytes: &[u8]) -> Result<Self, DecodeError>;
 }
 
 /// The queue's logical clock (D9). It only moves forward: a command stamped

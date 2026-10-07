@@ -38,7 +38,7 @@ fn snapshot_anywhere_then_continue() {
             let mut original = ReferenceQueue::new();
             run(&mut original, &cmds[..split]);
             let bytes = encode(&original);
-            let mut copy = ReferenceQueue::decode_state(2, &bytes)
+            let mut copy = ReferenceQueue::decode_state(3, &bytes)
                 .unwrap_or_else(|e| panic!("{}: after {split}: {e}", path.display()));
             assert_eq!(encode(&copy), bytes);
             let rest = &cmds[split..];

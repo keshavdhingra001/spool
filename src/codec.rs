@@ -13,6 +13,8 @@
 //! configure (6) = queue max_attempts:u32 backoff_base:u64 backoff_cap:u64
 //! redrive   (7) = queue
 //! tick      (8)
+//! complete (10) = job:u64 token:u64 payload          (D41)
+//! result   (11) = job:u64
 //! queue     = len:u8 bytes      (validated as a QueueName)
 //! payload   = len:u32 bytes
 //! key       = len:u8 bytes      (validated as a DedupKey)
@@ -38,13 +40,15 @@
 //! rejected (11) = reason:u8      (1 unknown_job, 2 not_leased, 3 stale_token,
 //!                                 4 zero_visibility, 5 bad_config)
 //! deduplicated (12) = job:u64 queue key
+//! completed (13) = job:u64 token:u64
+//! result   (14) = job:u64 status:u8 [token:u64 payload]   (0 pending, 1 done, 2 unknown)
 //! ```
 //!
 //! Tag 0 is never used, so a run of zero bytes never decodes as a command.
 
 use thiserror::Error;
 
-use crate::command::{Command, Event, Op, RejectReason, ReleaseReason};
+use crate::command::{Command, Event, Op, RejectReason, ReleaseReason, ResultStatus};
 use crate::retry::QueueConfig;
 use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};
 
@@ -74,6 +78,8 @@ const CONFIGURE: u8 = 6;
 const REDRIVE: u8 = 7;
 const TICK: u8 = 8;
 const ENQUEUE_KEYED: u8 = 9;
+const COMPLETE: u8 = 10;
+const RESULT: u8 = 11;
 
 /// Append the encoding of `cmd` to `out`.
 pub fn encode_command(cmd: &Command, out: &mut Vec<u8>) {
@@ -137,6 +143,16 @@ pub fn encode_op(op: &Op, out: &mut Vec<u8>) {
             put_name(out, queue);
         }
         Op::Tick => out.push(TICK),
+        Op::Complete { job, token, result } => {
+            out.push(COMPLETE);
+            put_u64(out, job.0);
+            put_u64(out, token.0);
+            put_payload(out, result);
+        }
+        Op::Result { job } => {
+            out.push(RESULT);
+            put_u64(out, job.0);
+        }
     }
 }
 
@@ -197,6 +213,14 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         REDRIVE => Op::Redrive { queue: r.name()? },
         TICK => Op::Tick,
+        COMPLETE => Op::Complete {
+            job: JobId(r.u64()?),
+            token: Token(r.u64()?),
+            result: r.payload()?,
+        },
+        RESULT => Op::Result {
+            job: JobId(r.u64()?),
+        },
         tag => return Err(DecodeError::UnknownTag { what: "op", tag }),
     };
     Ok(op)
@@ -214,6 +238,8 @@ const REDRIVEN: u8 = 9;
 const CONFIGURED: u8 = 10;
 const REJECTED: u8 = 11;
 const DEDUPLICATED: u8 = 12;
+const COMPLETED: u8 = 13;
+const RESULT_EVENT: u8 = 14;
 
 /// Append `events`, with their count, to `out` (D33).
 pub fn encode_events(events: &[Event], out: &mut Vec<u8>) {
@@ -330,6 +356,24 @@ pub fn encode_event(e: &Event, out: &mut Vec<u8>) {
             put_name(out, queue);
             put_key(out, key);
         }
+        Event::Completed { job, token } => {
+            out.push(COMPLETED);
+            put_u64(out, job.0);
+            put_u64(out, token.0);
+        }
+        Event::Result { job, status } => {
+            out.push(RESULT_EVENT);
+            put_u64(out, job.0);
+            match status {
+                ResultStatus::Pending => out.push(0),
+                ResultStatus::Done { token, payload } => {
+                    out.push(1);
+                    put_u64(out, token.0);
+                    put_payload(out, payload);
+                }
+                ResultStatus::Unknown => out.push(2),
+            }
+        }
     }
 }
 
@@ -414,6 +458,27 @@ fn read_event(r: &mut Reader) -> Result<Event, DecodeError> {
             job: JobId(r.u64()?),
             queue: r.name()?,
             key: r.key()?,
+        },
+        COMPLETED => Event::Completed {
+            job: JobId(r.u64()?),
+            token: Token(r.u64()?),
+        },
+        RESULT_EVENT => Event::Result {
+            job: JobId(r.u64()?),
+            status: match r.u8()? {
+                0 => ResultStatus::Pending,
+                1 => ResultStatus::Done {
+                    token: Token(r.u64()?),
+                    payload: r.payload()?,
+                },
+                2 => ResultStatus::Unknown,
+                tag => {
+                    return Err(DecodeError::UnknownTag {
+                        what: "result status",
+                        tag,
+                    });
+                }
+            },
         },
         tag => return Err(DecodeError::UnknownTag { what: "event", tag }),
     })
@@ -685,6 +750,8 @@ mod tests {
             "@10 nack 4 11",
             "@11 configure q 3 100 1000",
             "@12 redrive q",
+            "@13 complete 3 9 %00ok",
+            "@14 result 3",
             "@18446744073709551615 tick",
         ] {
             let cmd: Command = line.parse().unwrap();
@@ -710,7 +777,7 @@ mod tests {
         bytes.push(0);
         assert_eq!(decode_command(&bytes), Err(DecodeError::TrailingBytes(1)));
 
-        for tag in [0, 10, 255] {
+        for tag in [0, 12, 255] {
             let mut bytes = encode("@1 tick");
             bytes[8] = tag;
             assert_eq!(

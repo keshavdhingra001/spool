@@ -1,0 +1,58 @@
+# Transactional complete (D41, D42): ack and store a result in one command.
+@0 enqueue reports build-q3
+= enqueued job=1 queue=reports ready_at=0
+@0 result 1
+= result job=1 pending
+@10 lease reports 1000
+= leased job=1 token=1 deadline=1010 attempt=1 payload=build-q3
+@20 complete 1 1 s3://reports/q3.pdf
+= completed job=1 token=1
+# The reply was lost and the worker sends it again: the same answer, nothing
+# changes, and the result sent the second time is ignored.
+@30 complete 1 1 s3://reports/other.pdf
+= completed job=1 token=1
+@40 result 1
+= result job=1 done token=1 payload=s3://reports/q3.pdf
+# A zombie: its lease expires, another worker takes over, then the zombie
+# tries to complete. Its result never lands.
+@50 configure reports 3 0 0
+= configured queue=reports max_attempts=3 backoff_base=0 backoff_cap=0
+@50 enqueue reports build-q4
+= enqueued job=2 queue=reports ready_at=50
+@60 lease reports 100
+= leased job=2 token=2 deadline=160 attempt=1 payload=build-q4
+@200 lease reports 100
+= released job=2 token=2 reason=expired
+= retrying job=2 ready_at=160
+= leased job=2 token=3 deadline=300 attempt=2 payload=build-q4
+@210 complete 2 2 stale-result
+= rejected reason=stale_token
+@220 complete 2 3 fresh-result
+= completed job=2 token=3
+# After the job is gone, the zombie's repeat is not a repeat of its own.
+@230 complete 2 2 stale-result
+= rejected reason=unknown_job
+@240 result 2
+= result job=2 done token=3 payload=fresh-result
+# A job acked without a result keeps nothing.
+@250 enqueue reports build-q5
+= enqueued job=3 queue=reports ready_at=250
+@250 lease reports 100
+= leased job=3 token=4 deadline=350 attempt=1 payload=build-q5
+@260 ack 3 4
+= acked job=3
+@260 result 3
+= result job=3 unknown
+@260 complete 3 4 late
+= rejected reason=unknown_job
+# Results are kept for 300000 ms after the complete, exclusive (D41).
+@300019 result 1
+= result job=1 done token=1 payload=s3://reports/q3.pdf
+@300020 result 1
+= result job=1 unknown
+@300020 complete 1 1 s3://reports/q3.pdf
+= rejected reason=unknown_job
+@300219 result 2
+= result job=2 done token=3 payload=fresh-result
+@300220 result 2
+= result job=2 unknown

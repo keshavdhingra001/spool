@@ -14,7 +14,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use spool::{
     Checked, Command, DedupKey, Event, JobId, Millis, Op, Payload, Queue, QueueConfig, QueueName,
-    ReferenceQueue, Time, Token,
+    ReferenceQueue, ResultStatus, Time, Token,
 };
 
 #[derive(Clone, Debug)]
@@ -37,6 +37,12 @@ enum Action {
     },
     Nack {
         pick: usize,
+    },
+    Complete {
+        pick: usize,
+    },
+    Result {
+        job: u64,
     },
     Configure {
         queue: usize,
@@ -73,6 +79,8 @@ fn action() -> impl Strategy<Value = Action> {
         2 => (any::<usize>(), 0..40u64).prop_map(|(pick, visibility)| Action::Heartbeat { pick, visibility }),
         3 => any::<usize>().prop_map(|pick| Action::Ack { pick }),
         3 => any::<usize>().prop_map(|pick| Action::Nack { pick }),
+        2 => any::<usize>().prop_map(|pick| Action::Complete { pick }),
+        1 => (1..30u64).prop_map(|job| Action::Result { job }),
         1 => (queue.clone(), 0..4u32, 0..30u64, 0..40u64)
             .prop_map(|(queue, max, base, cap)| Action::Configure { queue, max, base, cap }),
         1 => queue.prop_map(|queue| Action::Redrive { queue }),
@@ -148,6 +156,15 @@ impl Resolver {
                 let (job, token) = pick(p);
                 Op::Nack { job, token }
             }
+            Action::Complete { pick: p } => {
+                let (job, token) = pick(p);
+                Op::Complete {
+                    job,
+                    token,
+                    result: Payload(format!("r{}", token.0).into_bytes()),
+                }
+            }
+            Action::Result { job } => Op::Result { job: JobId(job) },
             Action::Configure {
                 queue: q,
                 max,
@@ -201,6 +218,11 @@ fn event_kind(e: &Event) -> String {
     match e {
         Event::Rejected { reason } => format!("rejected {reason}"),
         Event::Released { reason, .. } => format!("released {reason}"),
+        Event::Result { status, .. } => match status {
+            ResultStatus::Pending => "result pending".into(),
+            ResultStatus::Done { .. } => "result done".into(),
+            ResultStatus::Unknown => "result unknown".into(),
+        },
         other => other.to_string().split(' ').next().unwrap().to_string(),
     }
 }
@@ -266,6 +288,15 @@ fn generator_covers_every_outcome() {
         let steps = strategy.new_tree(&mut runner).unwrap().current();
         let (_, events) = run_checked(&steps).unwrap();
         seen.extend(events.iter().map(event_kind));
+        // A job completed twice: the second is a repeat by the same lease (D42).
+        let mut completed = BTreeSet::new();
+        for e in &events {
+            if let Event::Completed { job, .. } = e
+                && !completed.insert(*job)
+            {
+                seen.insert("completed again".to_string());
+            }
+        }
         // A key enqueued a second time created a job: its window had ended.
         let mut keys = BTreeSet::new();
         for e in &events {
@@ -282,6 +313,8 @@ fn generator_covers_every_outcome() {
     }
     let expected = [
         "acked",
+        "completed",
+        "completed again",
         "configured",
         "dead",
         "deduplicated",
@@ -298,6 +331,9 @@ fn generator_covers_every_outcome() {
         "released expired",
         "released nack",
         "renewed",
+        "result done",
+        "result pending",
+        "result unknown",
         "retrying",
     ];
     let missing: Vec<_> = expected.iter().filter(|k| !seen.contains(**k)).collect();

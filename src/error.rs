@@ -8,7 +8,7 @@ pub enum ParseError {
     #[error("missing time: commands start with `@<ms>`, got `{0}`")]
     MissingTime(String),
     #[error(
-        "unknown command `{0}` (expected enqueue, lease, heartbeat, ack, nack, configure, redrive or tick)"
+        "unknown command `{0}` (expected enqueue, lease, heartbeat, ack, nack, complete, result, configure, redrive or tick)"
     )]
     UnknownCommand(String),
     #[error("`{command}` takes {expected} arguments, got {got}")]

@@ -12,6 +12,8 @@
 //! @<ms> lease     <queue> <visibility_ms>
 //! @<ms> heartbeat <job> <token> <visibility_ms>
 //! @<ms> ack       <job> <token>
+//! @<ms> complete  <job> <token> <result>
+//! @<ms> result    <job>
 //! @<ms> nack      <job> <token>
 //! @<ms> configure <queue> <max_attempts> <backoff_base_ms> <backoff_cap_ms>
 //! @<ms> redrive   <queue>
@@ -60,6 +62,17 @@ pub enum Op {
     },
     /// The job finished; remove it.
     Ack { job: JobId, token: Token },
+    /// The job finished with `result`: remove it and keep the result for 5
+    /// minutes, in one command (D41). Repeating it with the same token while
+    /// the result is kept changes nothing and succeeds again (D42).
+    Complete {
+        job: JobId,
+        token: Token,
+        result: Payload,
+    },
+    /// Ask whether `job` is still in the queue, finished with a result, or
+    /// neither (D41). Changes nothing but the clock.
+    Result { job: JobId },
     /// The job failed; give up the lease. It retries after a backoff (D13) or
     /// is dead-lettered if this was its last attempt (D15).
     Nack { job: JobId, token: Token },
@@ -103,6 +116,10 @@ pub enum Event {
     Renewed { lease: Lease },
     /// The job completed and is gone.
     Acked { job: JobId },
+    /// The job completed with a result under the lease `token` (D41).
+    Completed { job: JobId, token: Token },
+    /// The answer to a `result` op.
+    Result { job: JobId, status: ResultStatus },
     /// The lease ended without an ack, by nack or by reaching its deadline.
     /// Always followed by `Retrying` or `DeadLettered` for the same job.
     Released {
@@ -123,6 +140,17 @@ pub enum Event {
     },
     /// The command was refused and changed nothing except the clock.
     Rejected { reason: RejectReason },
+}
+
+/// What `result` found for a job (D41).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResultStatus {
+    /// The job is still in the queue: waiting, leased or dead.
+    Pending,
+    /// The job was completed under `token` with `payload` as its result.
+    Done { token: Token, payload: Payload },
+    /// No such job, a job acked without a result, or a result whose window ended.
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +241,20 @@ impl FromStr for Command {
                     token: Token(parse_num("token", args[1])?),
                 }
             }
+            "complete" => {
+                expect_args("complete", args, 3..=3, "3")?;
+                Op::Complete {
+                    job: JobId(parse_num("job", args[0])?),
+                    token: Token(parse_num("token", args[1])?),
+                    result: Payload::parse(args[2])?,
+                }
+            }
+            "result" => {
+                expect_args("result", args, 1..=1, "1")?;
+                Op::Result {
+                    job: JobId(parse_num("job", args[0])?),
+                }
+            }
             "configure" => {
                 expect_args("configure", args, 4..=4, "4")?;
                 Op::Configure {
@@ -300,6 +342,8 @@ impl fmt::Display for Command {
             } => write!(f, "heartbeat {job} {token} {visibility}"),
             Op::Ack { job, token } => write!(f, "ack {job} {token}"),
             Op::Nack { job, token } => write!(f, "nack {job} {token}"),
+            Op::Complete { job, token, result } => write!(f, "complete {job} {token} {result}"),
+            Op::Result { job } => write!(f, "result {job}"),
             Op::Configure { queue, config } => write!(f, "configure {queue} {config}"),
             Op::Redrive { queue } => write!(f, "redrive {queue}"),
             Op::Tick => write!(f, "tick"),
@@ -342,6 +386,14 @@ impl fmt::Display for Event {
                 lease.job, lease.token, lease.deadline
             ),
             Event::Acked { job } => write!(f, "acked job={job}"),
+            Event::Completed { job, token } => write!(f, "completed job={job} token={token}"),
+            Event::Result { job, status } => match status {
+                ResultStatus::Pending => write!(f, "result job={job} pending"),
+                ResultStatus::Done { token, payload } => {
+                    write!(f, "result job={job} done token={token} payload={payload}")
+                }
+                ResultStatus::Unknown => write!(f, "result job={job} unknown"),
+            },
             Event::Released { job, token, reason } => {
                 write!(f, "released job={job} token={token} reason={reason}")
             }
@@ -492,6 +544,18 @@ mod tests {
                 ),
             ),
             ("@9 tick", cmd(9, Op::Tick)),
+            (
+                "@10 complete 1 7 ok%20done",
+                cmd(
+                    10,
+                    Op::Complete {
+                        job: JobId(1),
+                        token: Token(7),
+                        result: Payload(b"ok done".to_vec()),
+                    },
+                ),
+            ),
+            ("@11 result 4", cmd(11, Op::Result { job: JobId(4) })),
         ];
         for (text, expected) in cases {
             assert_eq!(text.parse::<Command>(), Ok(expected.clone()), "{text}");
@@ -554,6 +618,10 @@ mod tests {
             ("@1 enqueue q a delay=-5", num("delay", "-5")),
             ("@1 tick now", wrong("tick", "0", 1)),
             ("@1 ack 1", wrong("ack", "2", 1)),
+            ("@1 complete 1 2", wrong("complete", "3", 2)),
+            ("@1 complete 1 2 %G", BadPayload("%G".into())),
+            ("@1 result", wrong("result", "1", 0)),
+            ("@1 result x", num("job", "x")),
             ("@1 configure q 1 2", wrong("configure", "4", 3)),
             ("@1 configure q x 1 2", num("max_attempts", "x")),
             ("@1 configure q 1 2 c", num("backoff_cap", "c")),
@@ -622,6 +690,37 @@ mod tests {
                 "renewed job=3 token=9 deadline=30005",
             ),
             (Event::Acked { job: JobId(3) }, "acked job=3"),
+            (
+                Event::Completed {
+                    job: JobId(3),
+                    token: Token(9),
+                },
+                "completed job=3 token=9",
+            ),
+            (
+                Event::Result {
+                    job: JobId(3),
+                    status: ResultStatus::Pending,
+                },
+                "result job=3 pending",
+            ),
+            (
+                Event::Result {
+                    job: JobId(3),
+                    status: ResultStatus::Done {
+                        token: Token(9),
+                        payload: Payload(b"a b".to_vec()),
+                    },
+                },
+                "result job=3 done token=9 payload=a%20b",
+            ),
+            (
+                Event::Result {
+                    job: JobId(3),
+                    status: ResultStatus::Unknown,
+                },
+                "result job=3 unknown",
+            ),
             (
                 Event::Released {
                     job: JobId(3),

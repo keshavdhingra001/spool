@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::command::Event;
+use crate::command::{Event, ResultStatus};
 use crate::reference::{Counts, JobState, ReferenceQueue};
 use crate::types::{DedupKey, JobId, Payload, QueueName, Token};
 
@@ -39,6 +39,10 @@ pub struct Ledger {
     /// clock, so it cannot tell when a key's window ends; it checks only that a
     /// `Deduplicated` names the job that key last created.
     keys: BTreeMap<(QueueName, DedupKey), JobId>,
+    /// Every job completed with a result (D41): the completing token, and the
+    /// payload once a `result` event has shown it. Kept forever, since the
+    /// ledger cannot tell when a result's window ends.
+    completed: BTreeMap<JobId, (Token, Option<Payload>)>,
 }
 
 impl Ledger {
@@ -77,6 +81,9 @@ impl Ledger {
         l.last_job = l.jobs.len() as u64 + c.acked;
         for (queue, key, job, _) in queue.dedup_keys() {
             l.keys.insert((queue, key), job);
+        }
+        for (job, token, payload, _) in queue.results() {
+            l.completed.insert(job, (token, Some(payload)));
         }
         l
     }
@@ -145,6 +152,43 @@ impl Ledger {
                 self.jobs.remove(job);
                 self.acked += 1;
             }
+            Event::Completed { job, token } => {
+                if let Some((t, _)) = self.completed.get(job) {
+                    // A repeat by the same lease (D42).
+                    if t != token {
+                        return Err(format!("completed again under token {t}"));
+                    }
+                } else {
+                    self.entry(*job, State::Leased(*token))?;
+                    self.jobs.remove(job);
+                    self.acked += 1;
+                    self.completed.insert(*job, (*token, None));
+                }
+            }
+            Event::Result { job, status } => match status {
+                ResultStatus::Pending => {
+                    if !self.jobs.contains_key(job) {
+                        return Err("pending, but the job is gone".into());
+                    }
+                }
+                ResultStatus::Done { token, payload } => {
+                    let Some((t, seen)) = self.completed.get_mut(job) else {
+                        return Err("done, but never completed".into());
+                    };
+                    if t != token {
+                        return Err(format!("done under token {token}, completed under {t}"));
+                    }
+                    if seen.as_ref().is_some_and(|p| p != payload) {
+                        return Err("result changed".into());
+                    }
+                    *seen = Some(payload.clone());
+                }
+                ResultStatus::Unknown => {
+                    if self.jobs.contains_key(job) {
+                        return Err("unknown, but the job is live".into());
+                    }
+                }
+            },
             Event::Released { job, token, .. } => {
                 self.entry(*job, State::Leased(*token))?.state = State::Released;
             }
@@ -306,6 +350,49 @@ mod tests {
                 .is_err()
         );
         assert!(Ledger::resume(&q).observe(&[dedup(2, "a", "k")]).is_err());
+    }
+
+    #[test]
+    fn checks_completions_and_results() {
+        let completed = |job, token| Event::Completed {
+            job: JobId(job),
+            token: Token(token),
+        };
+        let result = |job, status| Event::Result {
+            job: JobId(job),
+            status,
+        };
+        let done = |token, p: &[u8]| ResultStatus::Done {
+            token: Token(token),
+            payload: Payload(p.to_vec()),
+        };
+        let mut l = Ledger::new();
+        l.observe(&[enqueued(1), enqueued(2), result(1, ResultStatus::Pending)])
+            .unwrap();
+        l.observe(&[leased(1, 1, 1, b"x"), completed(1, 1), completed(1, 1)])
+            .unwrap();
+        l.observe(&[result(1, done(1, b"r")), result(1, done(1, b"r"))])
+            .unwrap();
+        l.observe(&[result(9, ResultStatus::Unknown)]).unwrap();
+        assert_eq!(l.counts().acked, 1);
+        let bad: [(&str, Vec<Event>); 7] = [
+            ("completed while waiting", vec![completed(2, 1)]),
+            ("completed again by another lease", vec![completed(1, 2)]),
+            (
+                "done for a job never completed",
+                vec![result(2, done(1, b"r"))],
+            ),
+            ("done under the wrong token", vec![result(1, done(2, b"r"))]),
+            ("result changed", vec![result(1, done(1, b"s"))]),
+            (
+                "pending after completion",
+                vec![result(1, ResultStatus::Pending)],
+            ),
+            ("unknown while live", vec![result(2, ResultStatus::Unknown)]),
+        ];
+        for (name, events) in bad {
+            assert!(l.clone().observe(&events).is_err(), "{name} accepted");
+        }
     }
 
     #[test]

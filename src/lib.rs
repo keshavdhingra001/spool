@@ -12,6 +12,7 @@ pub mod codec;
 pub mod command;
 pub mod durable;
 pub mod error;
+pub mod fence;
 pub mod ledger;
 pub mod protocol;
 pub mod queue;
@@ -25,7 +26,7 @@ pub mod wal;
 pub mod worker;
 
 pub use check::Checked;
-pub use command::{Command, Event, Op, RejectReason, ReleaseReason};
+pub use command::{Command, Event, Op, RejectReason, ReleaseReason, ResultStatus};
 pub use durable::{Durable, Options, Recovery};
 pub use error::{ParseError, StoreError};
 pub use queue::{Clock, Queue, Snapshot};

@@ -582,31 +582,37 @@ mod tests {
 
     #[test]
     fn loads_a_version_1_snapshot() {
-        // Rewrite run(8, 3)'s snapshot as M2 wrote it: version 1, no key table.
+        // Rewrite run(8, 3)'s snapshot as M2 wrote it: version 1, without the
+        // key and result tables (D35, D45).
         let mut files = run(8, 3).files();
         let snap = files.get_mut("snap-00000000000000000006").unwrap();
-        snap.truncate(snap.len() - 8);
-        snap[8..12].copy_from_slice(&1u32.to_le_bytes());
-        let body_len = (snap.len() - SNAP_HEADER_LEN) as u64;
-        snap[20..28].copy_from_slice(&body_len.to_le_bytes());
-        let crc = crc32c::crc32c_append(crc32c::crc32c(&snap[..28]), &snap[SNAP_HEADER_LEN..]);
-        snap[28..32].copy_from_slice(&crc.to_le_bytes());
-        let (mut d, rec) = reopen(files.clone()).unwrap();
+        snap.truncate(snap.len() - 16);
+        reseal(snap, 1);
+        let (mut d, rec) = reopen(files).unwrap();
         assert_eq!((rec.snapshot_lsn, rec.replayed), (6, 2));
         assert_eq!(state(d.queue()), reference(8));
-        // The next snapshot is written as version 2.
+        // The next snapshot is written in the current version.
         d.snapshot().unwrap();
         let files = d.storage().files();
         assert_eq!(
             files["snap-00000000000000000008"][8..12],
-            2u32.to_le_bytes()
+            ReferenceQueue::STATE_VERSION.to_le_bytes()
         );
 
-        let mut bad = run(8, 3).files();
-        bad.get_mut("snap-00000000000000000006").unwrap()[8..12]
-            .copy_from_slice(&3u32.to_le_bytes());
-        // The CRC covers the version, so a stray version is a checksum error.
-        assert!(corruption(reopen(bad)).contains("checksum"));
+        // A version from the future, with a valid checksum, is refused.
+        let mut files = run(8, 3).files();
+        let snap = files.get_mut("snap-00000000000000000006").unwrap();
+        reseal(snap, ReferenceQueue::STATE_VERSION + 1);
+        assert!(corruption(reopen(files)).contains("unknown snapshot version"));
+    }
+
+    /// Set a snapshot file's version and recompute its length and checksum.
+    fn reseal(snap: &mut [u8], version: u32) {
+        snap[8..12].copy_from_slice(&version.to_le_bytes());
+        let body_len = (snap.len() - SNAP_HEADER_LEN) as u64;
+        snap[20..28].copy_from_slice(&body_len.to_le_bytes());
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&snap[..28]), &snap[SNAP_HEADER_LEN..]);
+        snap[28..32].copy_from_slice(&crc.to_le_bytes());
     }
 
     #[test]

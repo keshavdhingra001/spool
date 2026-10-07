@@ -6,7 +6,7 @@ use spool::codec::{decode_events, encode_events};
 use spool::protocol::{Request, encode_request, read_frame};
 use spool::{
     DedupKey, Event, JobId, Lease, Millis, Op, Payload, QueueConfig, QueueName, RejectReason,
-    ReleaseReason, Time, Token,
+    ReleaseReason, ResultStatus, Time, Token,
 };
 
 fn queue() -> impl Strategy<Value = QueueName> {
@@ -77,6 +77,24 @@ fn event() -> impl Strategy<Value = Event> {
             RejectReason::BadConfig,
         ])
         .prop_map(|reason| Event::Rejected { reason }),
+        (job.clone(), any::<u64>()).prop_map(|(job, t)| Event::Completed {
+            job,
+            token: Token(t)
+        }),
+        (
+            job.clone(),
+            prop_oneof![
+                Just(ResultStatus::Pending),
+                Just(ResultStatus::Unknown),
+                (any::<u64>(), prop::collection::vec(any::<u8>(), 0..40)).prop_map(|(t, p)| {
+                    ResultStatus::Done {
+                        token: Token(t),
+                        payload: Payload(p),
+                    }
+                }),
+            ]
+        )
+            .prop_map(|(job, status)| Event::Result { job, status }),
         (job, queue(), key()).prop_map(|(job, queue, key)| Event::Deduplicated { job, queue, key }),
     ]
 }

@@ -200,9 +200,11 @@ fn workload(seed: u64, n: usize) -> Vec<Command> {
             3 | 4 => format!("@{now} lease {queue} {}", 1 + rng.below(12)),
             5..=7 if !leases.is_empty() => {
                 let (job, token) = leases[rng.below(leases.len() as u64) as usize];
-                match rng.below(3) {
+                match rng.below(5) {
                     0 => format!("@{now} heartbeat {job} {token} {}", 1 + rng.below(12)),
                     1 => format!("@{now} ack {job} {token}"),
+                    2 => format!("@{now} complete {job} {token} r{token}"),
+                    3 => format!("@{now} result {job}"),
                     _ => format!("@{now} nack {job} {token}"),
                 }
             }

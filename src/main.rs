@@ -58,6 +58,8 @@ commands (every queue command starts with its logical time in ms):
   @<ms> heartbeat <job> <token> <visibility_ms>
   @<ms> ack       <job> <token>
   @<ms> nack      <job> <token>
+  @<ms> complete  <job> <token> <result>      ack and keep the result for 5 min
+  @<ms> result    <job>
   @<ms> configure <queue> <max_attempts> <backoff_base_ms> <backoff_cap_ms>
   @<ms> redrive   <queue>
   @<ms> tick
@@ -219,6 +221,11 @@ fn main() -> io::Result<()> {
                 );
                 for job in queue.queue().jobs() {
                     println!("  {job}");
+                }
+                for (job, token, result, expires_at) in queue.queue().results() {
+                    println!(
+                        "  result job={job} token={token} payload={result} expires_at={expires_at}"
+                    );
                 }
                 for (q, key, job, expires_at) in queue.queue().dedup_keys() {
                     println!("  key={key} queue={q} job={job} expires_at={expires_at}");

@@ -45,7 +45,18 @@ fn op() -> impl Strategy<Value = Op> {
             visibility
         }),
         (job.clone(), token.clone()).prop_map(|(job, token)| Op::Ack { job, token }),
-        (job, token).prop_map(|(job, token)| Op::Nack { job, token }),
+        (job.clone(), token.clone()).prop_map(|(job, token)| Op::Nack { job, token }),
+        (
+            job.clone(),
+            token,
+            prop::collection::vec(any::<u8>(), 0..40)
+        )
+            .prop_map(|(job, token, r)| Op::Complete {
+                job,
+                token,
+                result: Payload(r)
+            }),
+        job.prop_map(|job| Op::Result { job }),
         Just(Op::Tick),
     ]
 }

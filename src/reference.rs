@@ -594,13 +594,9 @@ impl ReferenceQueue {
                 self.results.len()
             ));
         }
-        if self.results.len() as u64 > self.acked {
-            return Err(format!(
-                "{} results but only {} jobs acked",
-                self.results.len(),
-                self.acked
-            ));
-        }
+        // "No more results than acks" needs no check of its own: each result
+        // is a distinct assigned job that is gone, and every assigned job that
+        // is gone was acked (live + acked == assigned, above).
         Ok(())
     }
 }

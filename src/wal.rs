@@ -14,9 +14,6 @@ use crate::error::StoreError;
 
 pub const HEADER_LEN: usize = 24;
 pub const RECORD_HEADER_LEN: usize = 16;
-/// Longest record body accepted on read. Larger lengths are treated as a torn
-/// length field rather than allocated.
-pub const MAX_BODY: u32 = 16 << 20;
 const MAGIC: &[u8; 8] = b"SPOOLWAL";
 const VERSION: u32 = 1;
 const PREFIX: &str = "wal-";
@@ -131,7 +128,7 @@ pub fn scan(name: &str, bytes: &[u8], first_lsn: u64) -> Result<Scan, StoreError
         }
         let len = u32::from_le_bytes(rest[..4].try_into().unwrap());
         let end = RECORD_HEADER_LEN + len as usize;
-        if len > MAX_BODY || end > rest.len() {
+        if end > rest.len() {
             break; // cut short, or a length that points past the end (D23 known limit)
         }
         let record = &rest[..end];

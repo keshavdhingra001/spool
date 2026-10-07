@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod check;
+pub mod client;
 pub mod codec;
 pub mod command;
 pub mod durable;
@@ -21,6 +22,7 @@ pub mod server;
 pub mod storage;
 pub mod types;
 pub mod wal;
+pub mod worker;
 
 pub use check::Checked;
 pub use command::{Command, Event, Op, RejectReason, ReleaseReason};

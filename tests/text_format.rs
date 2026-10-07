@@ -2,7 +2,7 @@
 //! parses back to the same command.
 
 use proptest::prelude::*;
-use spool::{Command, JobId, Millis, Op, Payload, QueueName, Time, Token};
+use spool::{Command, JobId, Millis, Op, Payload, QueueConfig, QueueName, Time, Token};
 
 fn queue() -> impl Strategy<Value = QueueName> {
     "[A-Za-z0-9_.-]{1,64}".prop_map(|s| QueueName::new(&s).unwrap())
@@ -13,12 +13,27 @@ fn op() -> impl Strategy<Value = Op> {
     let token = any::<u64>().prop_map(Token);
     let ms = any::<u64>().prop_map(Millis);
     prop_oneof![
-        (queue(), prop::collection::vec(any::<u8>(), 0..40)).prop_map(|(queue, bytes)| {
-            Op::Enqueue {
+        (
+            queue(),
+            prop::collection::vec(any::<u8>(), 0..40),
+            ms.clone()
+        )
+            .prop_map(|(queue, bytes, delay)| Op::Enqueue {
                 queue,
                 payload: Payload(bytes),
+                delay,
+            }),
+        (queue(), any::<u32>(), ms.clone(), ms.clone()).prop_map(|(queue, n, base, cap)| {
+            Op::Configure {
+                queue,
+                config: QueueConfig {
+                    max_attempts: n,
+                    backoff_base: base,
+                    backoff_cap: cap,
+                },
             }
         }),
+        queue().prop_map(|queue| Op::Redrive { queue }),
         (queue(), ms.clone()).prop_map(|(queue, visibility)| Op::Lease { queue, visibility }),
         (job.clone(), token.clone(), ms).prop_map(|(job, token, visibility)| Op::Heartbeat {
             job,

@@ -6,14 +6,19 @@
 
 #![forbid(unsafe_code)]
 
+pub mod check;
 pub mod command;
 pub mod error;
+pub mod ledger;
 pub mod queue;
+pub mod reference;
 pub mod retry;
 pub mod types;
 
+pub use check::Checked;
 pub use command::{Command, Event, Op, RejectReason, ReleaseReason};
 pub use error::ParseError;
 pub use queue::{Clock, Queue};
+pub use reference::ReferenceQueue;
 pub use retry::QueueConfig;
 pub use types::{JobId, Lease, Millis, Payload, QueueName, Time, Token};

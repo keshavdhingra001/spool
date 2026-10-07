@@ -610,3 +610,129 @@ stores (D43), tested against seeded worker crashes and zombies (D46).
   after it, 734 lost replies, 669 cut requests, 723 zombies (144 of their writes refused by the
   fence, 403 of their completes refused by the queue, 320 accepted because their lease was still
   current), 677 normal completions. The test asserts every one of these cases was reached.
+
+### D47: Simulator shape: sans-IO processes on a discrete-event loop
+- **What:** `spool::sim` runs a whole system in one thread. Every participant is a `Process<M>`
+  with three entry points (start, a message arrived, a timer fired) and no other way to see the
+  world: a `Ctx` gives it its node's clock, the simulator's random numbers, `send` and
+  `set_timer`. The `World` keeps a queue of pending deliveries and timers ordered by `(time,
+  sequence number)` and executes them one at a time; nothing runs between events, so the order of
+  events is the whole schedule. The server's batch logic moves out of the core thread into
+  `server::Core` (apply a batch at one time, run the checkers, count), which the real core thread
+  and the simulated server node both call.
+- **Alternatives:** a deterministic async executor that runs the real tokio code (madsim style,
+  or writing our own); the `turmoil` crate; real threads under a controlling scheduler.
+- **Why:** Raft (M6) has to be a state machine of messages and timers to be tested at all, so the
+  simulator is built for that shape now, and the queue core already is one (D4). An event loop
+  needs no executor, no crate and no `unsafe`, and makes every interleaving an explicit, printable
+  event. The cost is stated: the tokio plumbing (sockets, tasks, backpressure) and the real
+  `Client` and `Worker` are not inside the simulation; the simulated server shares `Core`,
+  `Durable`, the codecs and the queue with the real one, and the simulated worker follows the
+  same protocol as `Worker` (D36, D44). The tokio layer is covered by D39/D46 and again by M10.
+
+### D48: One seed, our own generator, integer probabilities
+- **What:** a run is a function of one `u64` seed. The generator is SplitMix64 (64-bit state, one
+  add and three xor-shift-multiplies per number). Probabilities are integers in parts per million
+  and ranges are drawn with `below(n)`; no floating point decides anything. Every run keeps a
+  64-bit FNV-1a hash of its trace (each executed event: time, kind, nodes, message digest); two
+  runs of a seed must give the same hash, and a test checks it.
+- **Alternatives:** the `rand` crate; a generator per process; floats for probabilities.
+- **Why:** a seed is only a bug report if the whole run follows from it, so the generator must not
+  change with a dependency update, and SplitMix64 is ten lines with good statistical quality for
+  this. One generator drawn in event order is deterministic because the event order is. Integer
+  probabilities avoid any argument about float behaviour across platforms. The trace hash turns
+  "deterministic" from a belief into a checked property.
+
+### D49: Network model: datagrams with loss, delay, duplication and partitions
+- **What:** a message from node `a` to node `b` is delivered at `now + delay` or dropped. Each
+  message independently: dropped with probability `drop`, duplicated with probability `dup` (the
+  copy gets its own delay), delayed by a uniform base delay and, with probability `spike`, by up
+  to a long spike (seconds). Reordering follows from independent delays. A partition is a set of
+  cut directed links, checked at send and at delivery; healing removes the cut. Messages to a node
+  that is down or crashed are lost. In the queue world (D51) a queue message is one protocol frame
+  (D32), encoded and decoded with the real codec; there is no connection and no hello.
+- **Alternatives:** model TCP connections (ordered, reliable until reset); fixed delays.
+- **Why:** Raft must survive loss, duplication and reordering, so the network provides all three.
+  For the queue, a lost TCP connection means requests and replies vanish and the client retries
+  on a new connection, which looks to the server exactly like datagrams lost and duplicated, so
+  the datagram model covers it and adds reordering, which is stricter. Checking cuts again at
+  delivery means a partition also kills messages already in flight.
+
+### D50: Disk model: crash images and failing calls
+- **What:** each node's disk is a `SimDisk` (a shared `MemStorage`, D28) owned by the world and
+  surviving the node's crashes. A crash replaces the disk with one crash image chosen by the seed:
+  synced or unsynced directory, a prefix or zero tail of an unsynced write (D28). A torn write is
+  a crash in the middle of a batch: the disk is told to fail at a chosen mutating call of the next
+  batch, the batch fails, the server stops (D38), and the crash image is taken from that state, so
+  half-written records and half-written snapshots happen. The node restarts after a downtime and
+  recovers (D29).
+- **Alternatives:** whole files lost or garbage written; reordered writes within a file.
+- **Why:** this reuses the crash model the M2 harness already proves exhaustively, now at random
+  points of a live workload with clients waiting on replies. Garbage beyond zeros and reordered
+  writes stay outside the model, as D28 says.
+
+### D51: What M5 simulates before Raft exists
+- **What:** one queue server node, workers, producers and an external store, all processes:
+  - the **server** wraps `Core` over a `SimDisk`. Requests wait while a batch is syncing; the sync
+    takes 1–5 ms of simulated time, and everything that arrived meanwhile is the next batch, so
+    group commit (D30) happens by itself. Its clock is simulated time plus an offset faults move.
+  - **producers** enqueue a fixed list of jobs, each with a dedup key (D35), retrying on timeout
+    until they get the job id.
+  - **workers** follow D36/D44: lease, heartbeat every visibility/3, drop the job on a rejected
+    heartbeat, write the effect to the store with the lease token and wait for its ack, then
+    `complete` with the effect as the result, retrying `complete` with the same token on timeout
+    (D42); idle backoff with jitter.
+  - the **store** is a `FencedStore` (D43) over the network, so a delayed write is a zombie write.
+- **Alternatives:** wait for M6 and only simulate Raft; simulate the queue without a store.
+- **Why:** the single-node queue already has the properties M5 must check end to end (durable
+  replies, dedup across retries and crashes, effectively-once effects), so the simulator proves
+  itself on them before Raft adds a second source of bugs. A store across the network is what
+  makes zombies natural instead of scripted: any delayed write is one.
+
+### D52: Faults, chosen per seed (swarm testing)
+- **What:** each seed first picks which faults are on and how strong: drop up to 20%, duplication
+  up to 5%, delay spikes, partitions (one node cut off for up to 3 s, then healed), crashes of
+  workers, producers and the server with restarts after up to 2 s, torn writes on the server,
+  pauses (a node frozen for up to three visibility timeouts, its messages and timers held until it
+  wakes), and server clock jumps forward (expiring leases early) and back (clamped by D9). Faults
+  are injected for the first 30 s of simulated time; then the network heals, faults stop, and the
+  run must finish within a deadline.
+- **Alternatives:** every fault on at fixed rates in every run.
+- **Why:** with everything on at once, some bugs need a quiet stretch to show (a fault that only
+  matters if nothing else interrupts it), and others hide behind more common faults. Varying the
+  mix per seed explores both, which is the swarm-testing result (Groce et al.) and what
+  FoundationDB does. The quiet phase turns liveness into a check: a system that is correct but
+  stuck fails the run.
+
+### D53: What a run checks
+- **What:** during the run: after every server batch, both checkers (D19) with the ledger resumed
+  after each recovery; at every recovery, that the recovered log length `k` is at least the last
+  replied command and at most the last attempted one, and that the recovered state equals a fresh
+  replay of the first `k` commands of the server's history (the D28 rule, live). At the end, on a
+  queue recovered from the server's disk: every key a producer enqueued maps to one job and no
+  other job exists (dedup across retries and crashes); every job is completed, none dead or still
+  queued; each job's result is the value the store holds for it, and that value was written by
+  the completing token (D40, D46); per key the store's accepted tokens never went down; and the
+  run finished before the deadline. A failure panics with the seed and the command that replays
+  it with a trace.
+- **Alternatives:** only end-of-run checks; a full history checker now.
+- **Why:** checks at every batch and every recovery point at the moment a bug happens instead of
+  its consequence later. The Jepsen-style history checker over client-observed operations is M9;
+  these checks use the server's own view plus the store, which is enough for one node.
+
+### D54: Planted bugs
+- **What:** the queue world takes a `Bug` switch that breaks one thing on purpose: `NoFence` (the
+  store accepts any token) or `NoDedupKey` (producers retry without a key). A test runs seeds with
+  each bug until one fails and asserts it fails within a bound and with the expected check.
+- **Alternatives:** rely on mutation passes alone.
+- **Why:** a simulator that never fails proves nothing; one that finds a known bug within a few
+  seeds shows its faults reach the cases that matter. Mutation passes still run on the real code;
+  the planted bugs are the always-on version for the two properties a reader asks about first.
+
+### D55: Running and replaying seeds
+- **What:** `tests/sim.rs` runs a fixed range of seeds and asserts every fault and every
+  interesting outcome was reached (coverage counters, as D46). `SPOOL_SIM_SEEDS=a..b` runs another
+  range. `spool sim --seed N [--trace]` replays one seed and prints its events; `spool sim
+  --seeds a..b` sweeps a range and prints the first failing seed.
+- **Why:** the fixed range keeps `cargo test` fast and repeatable; the sweep finds new failures;
+  the replay is how a failure is debugged, since the same seed gives the same events every time.

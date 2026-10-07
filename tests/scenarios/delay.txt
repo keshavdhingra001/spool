@@ -1,0 +1,19 @@
+# Delayed jobs (D17): leasable from now + delay, ordered by (ready_at, id).
+@0 enqueue q later delay=100
+= enqueued job=1 queue=q ready_at=100
+@0 enqueue q soon delay=50
+= enqueued job=2 queue=q ready_at=50
+@0 enqueue q now
+= enqueued job=3 queue=q ready_at=0
+@10 lease q 1000
+= leased job=3 token=1 deadline=1010 attempt=1 payload=now
+@10 lease q 1000
+= empty queue=q
+@49 lease q 1000
+= empty queue=q
+@50 lease q 1000
+= leased job=2 token=2 deadline=1050 attempt=1 payload=soon
+@50 lease q 1000
+= empty queue=q
+@100 lease q 1000
+= leased job=1 token=3 deadline=1100 attempt=1 payload=later

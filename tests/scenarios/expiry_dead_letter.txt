@@ -1,0 +1,23 @@
+# A job that crashes every worker never nacks; its leases expire. Expiry counts
+# as an attempt (D15), so the poison job still ends up dead instead of looping.
+@0 configure q 2 0 0
+= configured queue=q max_attempts=2 backoff_base=0 backoff_cap=0
+@0 enqueue q poison
+= enqueued job=1 queue=q ready_at=0
+@0 lease q 10
+= leased job=1 token=1 deadline=10 attempt=1 payload=poison
+@10 lease q 10
+= released job=1 token=1 reason=expired
+= retrying job=1 ready_at=10
+= leased job=1 token=2 deadline=20 attempt=2 payload=poison
+@20 tick
+= released job=1 token=2 reason=expired
+= dead job=1
+@20 lease q 10
+= empty queue=q
+@21 redrive q
+= redriven job=1
+@21 lease q 10
+= leased job=1 token=3 deadline=31 attempt=1 payload=poison
+@22 ack 1 3
+= acked job=1

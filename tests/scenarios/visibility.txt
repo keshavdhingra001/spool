@@ -1,0 +1,42 @@
+# Visibility timeouts: a lease is valid while now < deadline (D18).
+@0 enqueue q a
+= enqueued job=1 queue=q ready_at=0
+@0 lease q 100
+= leased job=1 token=1 deadline=100 attempt=1 payload=a
+# Deadline is 100: an ack at 99 still works.
+@99 ack 1 1
+= acked job=1
+@100 enqueue q b
+= enqueued job=2 queue=q ready_at=100
+@100 lease q 100
+= leased job=2 token=2 deadline=200 attempt=1 payload=b
+# At exactly the deadline (200) the lease expires before the ack is applied,
+# so the ack is refused even though nobody else has leased the job.
+@200 ack 2 2
+= released job=2 token=2 reason=expired
+= retrying job=2 ready_at=709
+= rejected reason=not_leased
+@201 heartbeat 2 2 100
+= rejected reason=not_leased
+# Heartbeats move the deadline to now + visibility; they can also shorten it.
+@1000 enqueue h c
+= enqueued job=3 queue=h ready_at=1000
+@1000 lease h 100
+= leased job=3 token=3 deadline=1100 attempt=1 payload=c
+@1050 heartbeat 3 3 100
+= renewed job=3 token=3 deadline=1150
+@1149 heartbeat 3 3 10
+= renewed job=3 token=3 deadline=1159
+@1158 tick
+@1159 tick
+= released job=3 token=3 reason=expired
+= retrying job=3 ready_at=1983
+# A visibility of 0 would expire at the moment it was granted.
+@1200 lease h 0
+= rejected reason=zero_visibility
+@1200 enqueue z d
+= enqueued job=4 queue=z ready_at=1200
+@1200 lease z 50
+= leased job=4 token=4 deadline=1250 attempt=1 payload=d
+@1201 heartbeat 4 4 0
+= rejected reason=zero_visibility

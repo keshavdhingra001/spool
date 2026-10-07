@@ -1,0 +1,36 @@
+# nack retries with exponential backoff and deterministic jitter (D13), then
+# dead-letters on the last attempt (D15). Redrive resets attempts (D16).
+@0 configure jobs 3 100 1000
+= configured queue=jobs max_attempts=3 backoff_base=100 backoff_cap=1000
+@0 enqueue jobs resize:7
+= enqueued job=1 queue=jobs ready_at=0
+@0 lease jobs 1000
+= leased job=1 token=1 deadline=1000 attempt=1 payload=resize:7
+# Attempt 1 failed at 10: d = 100, jittered into [50, 100].
+@10 nack 1 1
+= released job=1 token=1 reason=nack
+= retrying job=1 ready_at=67
+@10 lease jobs 1000
+= empty queue=jobs
+@66 lease jobs 1000
+= empty queue=jobs
+@67 lease jobs 1000
+= leased job=1 token=2 deadline=1067 attempt=2 payload=resize:7
+# Attempt 2 failed at 70: d = 200, jittered into [100, 200].
+@70 nack 1 2
+= released job=1 token=2 reason=nack
+= retrying job=1 ready_at=243
+@300 lease jobs 1000
+= leased job=1 token=3 deadline=1300 attempt=3 payload=resize:7
+# Attempt 3 was the last.
+@301 nack 1 3
+= released job=1 token=3 reason=nack
+= dead job=1
+@400 lease jobs 1000
+= empty queue=jobs
+@500 redrive jobs
+= redriven job=1
+@500 lease jobs 1000
+= leased job=1 token=4 deadline=1500 attempt=1 payload=resize:7
+@501 ack 1 4
+= acked job=1

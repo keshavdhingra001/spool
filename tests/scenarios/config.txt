@@ -1,0 +1,23 @@
+# configure validates (D14), creates the queue, and applies to later failures,
+# including jobs already in the queue.
+@0 configure q 0 10 10
+= rejected reason=bad_config
+@0 configure q 3 20 10
+= rejected reason=bad_config
+@0 configure q 3 10 10
+= configured queue=q max_attempts=3 backoff_base=10 backoff_cap=10
+@0 enqueue q a
+= enqueued job=1 queue=q ready_at=0
+@0 lease q 100
+= leased job=1 token=1 deadline=100 attempt=1 payload=a
+# Lowering max_attempts to 1 makes this first failure the last.
+@1 configure q 1 10 10
+= configured queue=q max_attempts=1 backoff_base=10 backoff_cap=10
+@2 nack 1 1
+= released job=1 token=1 reason=nack
+= dead job=1
+# Redrive on a queue with no dead jobs, or one that does not exist, does nothing.
+@3 redrive other
+@3 redrive q
+= redriven job=1
+@3 redrive q

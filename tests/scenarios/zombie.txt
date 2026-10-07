@@ -1,0 +1,33 @@
+# The zombie worker (D5): A's lease expires while it stalls, B leases the job,
+# then A wakes up. A's token is older than B's, so everything A sends is refused.
+@0 configure q 5 0 0
+= configured queue=q max_attempts=5 backoff_base=0 backoff_cap=0
+@0 enqueue q charge-card
+= enqueued job=1 queue=q ready_at=0
+# Worker A gets token 1, deadline 30.
+@0 lease q 30
+= leased job=1 token=1 deadline=30 attempt=1 payload=charge-card
+# A stalls. At 30 the lease expires and, with zero backoff, the job is ready again.
+@30 lease q 30
+= released job=1 token=1 reason=expired
+= retrying job=1 ready_at=30
+= leased job=1 token=2 deadline=60 attempt=2 payload=charge-card
+# Worker B holds token 2. A wakes up and tries to finish.
+@40 heartbeat 1 1 30
+= rejected reason=stale_token
+@41 ack 1 1
+= rejected reason=stale_token
+@42 nack 1 1
+= rejected reason=stale_token
+# B is unaffected and acks normally.
+@50 ack 1 2
+= acked job=1
+# A forged token from the future is refused the same way.
+@51 enqueue q x
+= enqueued job=2 queue=q ready_at=51
+@51 lease q 30
+= leased job=2 token=3 deadline=81 attempt=1 payload=x
+@52 ack 2 99
+= rejected reason=stale_token
+@53 ack 2 3
+= acked job=2

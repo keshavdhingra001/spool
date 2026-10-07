@@ -1,0 +1,27 @@
+# Enqueue, lease, ack: the happy path, FIFO order, and what an empty queue says.
+@0 enqueue emails send:1
+= enqueued job=1 queue=emails ready_at=0
+@0 enqueue emails send:2
+= enqueued job=2 queue=emails ready_at=0
+@0 enqueue emails hello%20world
+= enqueued job=3 queue=emails ready_at=0
+@10 lease emails 1000
+= leased job=1 token=1 deadline=1010 attempt=1 payload=send:1
+@11 lease emails 1000
+= leased job=2 token=2 deadline=1011 attempt=1 payload=send:2
+@12 ack 1 1
+= acked job=1
+# Acked jobs are gone: a second ack is unknown_job.
+@13 ack 1 1
+= rejected reason=unknown_job
+@14 ack 2 2
+= acked job=2
+@15 lease emails 1000
+= leased job=3 token=3 deadline=1015 attempt=1 payload=hello%20world
+@16 lease emails 1000
+= empty queue=emails
+# A queue that was never used is just empty; leasing it does not create it.
+@17 lease nothing 1000
+= empty queue=nothing
+@18 ack 3 3
+= acked job=3

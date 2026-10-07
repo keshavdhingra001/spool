@@ -1,0 +1,24 @@
+# The clock only moves forward (D9): a command stamped in the past runs at the
+# clock's time. Expiry happens before the command, oldest deadline first.
+@100 tick
+@50 enqueue q a
+= enqueued job=1 queue=q ready_at=100
+@60 lease q 10
+= leased job=1 token=1 deadline=110 attempt=1 payload=a
+@0 enqueue q b
+= enqueued job=2 queue=q ready_at=100
+@0 enqueue q c
+= enqueued job=3 queue=q ready_at=100
+@105 lease q 30
+= leased job=2 token=2 deadline=135 attempt=1 payload=b
+@105 lease q 5
+= leased job=3 token=3 deadline=110 attempt=1 payload=c
+# One tick expires all three, in deadline order (110, 110, 135): job 1 and job 3
+# tie at 110 and go by id.
+@200 tick
+= released job=1 token=1 reason=expired
+= retrying job=1 ready_at=887
+= released job=3 token=3 reason=expired
+= retrying job=3 ready_at=934
+= released job=2 token=2 reason=expired
+= retrying job=2 ready_at=644

@@ -1,0 +1,21 @@
+# Queues are independent, but job ids and fencing tokens are global (D10).
+@0 enqueue a a1
+= enqueued job=1 queue=a ready_at=0
+@0 enqueue b b1
+= enqueued job=2 queue=b ready_at=0
+@0 enqueue a a2
+= enqueued job=3 queue=a ready_at=0
+@1 lease b 100
+= leased job=2 token=1 deadline=101 attempt=1 payload=b1
+@1 lease a 100
+= leased job=1 token=2 deadline=101 attempt=1 payload=a1
+@1 lease b 100
+= empty queue=b
+@1 lease a 100
+= leased job=3 token=3 deadline=101 attempt=1 payload=a2
+@2 ack 2 1
+= acked job=2
+@2 ack 1 2
+= acked job=1
+@2 ack 3 3
+= acked job=3

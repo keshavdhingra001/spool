@@ -244,7 +244,7 @@ independent checkers (D19) over scenario files (D20) and random command sequence
 - **Why:** the checker sees internals but trusts them; the ledger sees only output. A bug that
   makes state and events disagree is caught by the comparison. Both run on 9 scenario files and
   on 500 random sequences of up to 300 commands per property, whose generator is checked to reach
-  every event and rejection. Unit tests corrupt the state seven ways and feed the ledger eight
+  every event and rejection. Unit tests corrupt the state eight ways and feed the ledger eight
   impossible histories to show both actually catch something.
 
 ### D20: Scenario files

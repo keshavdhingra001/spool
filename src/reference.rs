@@ -778,6 +778,16 @@ mod tests {
             ReferenceQueue::decode_state(&swapped),
             Err(DecodeError::Invalid(m)) if m.contains("out of order")
         ));
+        // A duplicate id is out of order too (the invariant checker would also
+        // refuse it, as two index entries for one job, but less clearly).
+        let mut duplicate = bytes.clone();
+        let job2 = 66 + 8 + 2 + 5 + 4 + 1 + 16;
+        assert_eq!(duplicate[job2], 2);
+        duplicate[job2] = 1;
+        assert!(matches!(
+            ReferenceQueue::decode_state(&duplicate),
+            Err(DecodeError::Invalid(m)) if m.contains("job 1 out of order")
+        ));
         let mut bad_tag = bytes;
         let job1_state = 66 + 8 + 2 + 5 + 4;
         assert_eq!(bad_tag[job1_state], LEASED);

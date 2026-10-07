@@ -276,6 +276,9 @@ impl<S: Storage, Q: Snapshot> Durable<S, Q> {
         self.storage.append(&tmp, &bytes)?;
         self.storage.sync(&tmp)?;
         self.storage.rename(&tmp, &name)?;
+        // `start_segment` syncs the directory again before anything is deleted,
+        // so this one is not needed for safety; it makes the snapshot durable
+        // at the step that creates it instead of depending on the next step.
         self.storage.sync_dir()?;
         // From here the snapshot is the recovery point; the old log is garbage.
         self.start_segment(lsn + 1)?;

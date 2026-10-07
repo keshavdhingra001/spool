@@ -283,8 +283,9 @@ independent checkers (D19) over scenario files (D20) and random command sequence
   consecutive across all segments; a segment's file name carries its first LSN.
 - **Alternatives:** lsmkv's `[crc][kind][lens][data]` with no sequence number; LevelDB's 32 KiB
   blocks with fragmented records.
-- **Why:** covering `len` with the CRC means a flipped length bit is caught instead of silently
-  splitting the log at the wrong place. The LSN ties records to snapshots (replay starts after the
+- **Why:** the CRC covers `len` as belt and braces: a damaged length moves the end of the record,
+  so the CRC over the body would almost surely fail anyway (the M2 mutation pass confirmed no test
+  can tell the difference). The LSN ties records to snapshots (replay starts after the
   snapshot's LSN) and catches a missing or duplicated record, which a per-record CRC cannot.
   CRC-32C has hardware support on x86 and ARM. **Known limit (as lsmkv D2):** a corrupted length
   that points past the end of the file looks like a torn tail and is truncated. Fixed-size blocks

@@ -1,0 +1,12 @@
+[package]
+name = "spool"
+version = "0.1.0"
+edition = "2024"
+description = "A distributed task queue: own broker, leases with fencing tokens, Raft replication, deterministic simulation"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

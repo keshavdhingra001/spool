@@ -8,8 +8,10 @@
 
 pub mod command;
 pub mod error;
+pub mod queue;
 pub mod types;
 
 pub use command::{Command, Event, Op, RejectReason, ReleaseReason};
 pub use error::ParseError;
+pub use queue::{Clock, Queue};
 pub use types::{JobId, Lease, Millis, Payload, QueueName, Time, Token};

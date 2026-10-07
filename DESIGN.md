@@ -15,7 +15,8 @@ producers / workers ──TCP──> node ────────────�
                          pure, deterministic, logical time ◄─────────────────────┘
 ```
 
-Today (M0): the command/event model, the text format and the `Queue` trait. No queue
+Today (M0): the command/event model with time inside every command (D9), broker-assigned ids
+and fencing tokens (D10), the `Queue` trait (D11) and the text format (D12). No queue
 implementation yet; M1 adds the reference queue.
 
 ## Decisions
@@ -111,3 +112,47 @@ implementation yet; M1 adds the reference queue.
 - **What:** `spool`, at `~/Projects/spool`. The GitHub repo stays private until Tier 1 (M0–M4) is done.
 - **Why:** short, not taken by a well-known queue, and a spool is a thing that holds work until
   it is consumed. Private until the single-node queue is correct and durable, as with the sibling projects.
+
+### D9: Time arrives in every command; the clock only moves forward
+- **What:** every command carries `at: Time` (logical milliseconds). The queue's clock becomes
+  `max(clock, at)` and the command runs at that time. Before applying the command, every lease
+  whose deadline is at or before the clock expires. `tick` advances the clock and does nothing else.
+- **Alternatives:** reject a command whose time is earlier than the clock; let the queue read a
+  clock; expire leases from a timer.
+- **Why:** time inside commands is what D4 requires, and it makes expiry deterministic: two
+  replicas applying the same commands expire the same leases at the same point in the stream.
+  Clamping instead of rejecting matters once time is stamped by a Raft leader (M7): after a
+  failover, the new leader's clock can be slightly behind the old one's, and rejecting its
+  commands would make the queue unavailable until its clock caught up. Clamping costs only that
+  such commands run a little "late", which no lease rule can observe. The edge sends `tick`
+  periodically so leases expire even when no other traffic arrives.
+
+### D10: Broker-assigned job ids, one global counter of fencing tokens
+- **What:** `enqueue` does not carry an id; the queue assigns `JobId`s from a counter (1, 2, 3, ...).
+  Every lease takes the next `Token` from a second counter shared by all jobs and queues.
+- **Alternatives:** client-assigned ids (as in lob's D3); random UUIDs; tokens per job.
+- **Why:** the ids come from the state machine, so they are still a pure function of the command
+  sequence and replay identically (D4); clients cannot collide or forge an id. Retrying an
+  enqueue without creating a duplicate is a separate concern, solved with idempotency keys in M3
+  (a client-assigned id would conflate the two). One global token counter means a newer lease
+  always has a larger token, even across jobs, so a downstream store can keep a single
+  "highest token seen" per resource. Tokens per job would also be correct for the queue itself
+  but give downstream stores less to work with.
+
+### D11: Caller-owned output buffer
+- **What:** `Queue::apply(&mut self, cmd: &Command, out: &mut Vec<Event>)` appends to `out`.
+- **Why:** returning a fresh `Vec` per command allocates on every command. With a reused buffer
+  the steady state allocates nothing (measured in M11). Same choice as lob's D5.
+
+### D12: Text command format (REPL, scenario files)
+- **What:** one command per line, starting with its time: `@<ms> enqueue <queue> <payload>`,
+  `@<ms> lease <queue> <visibility_ms>`, `@<ms> heartbeat <job> <token> <visibility_ms>`,
+  `@<ms> ack <job> <token>`, `@<ms> nack <job> <token>`, `@<ms> tick`. Payload bytes from `!` to
+  `~` except `%` stand for themselves, any other byte is `%XX`, and `-` is the empty payload.
+  Queue names are 1-64 characters from `[A-Za-z0-9_.-]`. Numbers are plain decimal (no sign).
+  Events print as `name key=value ...`. `Display` prints exactly what `FromStr` parses, checked
+  by a property test over random commands.
+- **Alternatives:** JSON lines; hex payloads; payload as the rest of the line.
+- **Why:** scenario files stay readable (`@0 enqueue emails send:42`) while any byte string still
+  fits in one whitespace-free token, so every command has exactly one line form. The binary
+  wire format (M3) and log format (M2) are separate decisions, where size and decode speed matter.

@@ -379,3 +379,137 @@ independent checkers (D19) over scenario files (D20) and random command sequence
   The lock closes the gap lsmkv D7 left open: two processes appending to one log interleave
   records and corrupt it. `Durable` cannot implement `Queue` because `Queue::apply` has no way to
   report a disk error, and swallowing it would break D22.
+
+### D30: Server structure
+- **What:** tokio handles the sockets. One dedicated OS thread owns the `Durable` queue and takes
+  requests from a bounded channel. It blocks for the first request, then drains whatever else is
+  already queued (up to 256 requests) and applies them all with one `apply_batch`: one append and
+  one sync for the whole batch, which is group commit. Replies go back on per-request oneshot
+  channels after the sync.
+- **Alternatives:** threads with the queue behind a mutex; the queue inside an async task.
+- **Why:** one owner means no locks and one total order of commands, which is the order the log
+  holds and the order Raft will impose in M7. `fdatasync` blocks for milliseconds; on its own
+  thread it never stalls the reactor that serves the sockets, and while it runs the next batch
+  builds up in the channel, so the sync cost is shared by every client waiting at that moment.
+  A mutex would give the same order but one sync per request unless batching is rebuilt on top of
+  it; an async task would block a runtime worker on every sync.
+
+### D31: Time source
+- **What:** the server's core thread stamps every command with wall-clock milliseconds since the
+  Unix epoch, read once per batch. This is the only clock read in spool; the core still never reads
+  one (D4). Clients never send a time: the wire carries ops, not commands. A clock that steps back
+  (NTP, a restart on another machine) is clamped by D9. There are no logged periodic ticks: expiry is
+  lazy and happens at the next command that reaches the queue. The clock is a parameter of the
+  server so tests can drive it by hand.
+- **Alternatives:** client-sent time; a monotonic `Instant`; a timer that logs a tick every second.
+- **Why:** epoch time keeps rising across restarts, so a recovered queue's clock and the new
+  process's stamps line up; an `Instant` restarts from an arbitrary origin in every process. A
+  client clock would let one skewed worker expire everyone's leases. Ticks would make an idle queue
+  write to its log forever; lazy expiry is correct because a lease that expired unnoticed is
+  indistinguishable from one noticed late: D18 fails it as of its deadline either way.
+
+### D32: Frames
+- **What:** every frame is `[len u32][kind u8][request id u64][body]`, little-endian, `len`
+  counting everything after itself. Frames over 1 MiB are refused and the connection closed. The
+  client's first frame must be `hello` with protocol version 1; the server answers `hello_ok` or an
+  error and closes. Then each `request` frame carries one op (the D24 op encoding, without `at`).
+  Requests may be pipelined; replies come back in request order and echo the request id, which the
+  client checks. Replies are `events` (the events of that command) or `error` (code and message,
+  then close).
+- **Alternatives:** gRPC/protobuf; HTTP + JSON; a RESP-style text protocol.
+- **Why:** the op codec already exists and is pinned by golden bytes, so the wire adds a header
+  and nothing else. A length prefix lets either side read a whole frame before decoding it, and the
+  cap stops a bad length from allocating gigabytes. In-order replies follow from the single core
+  thread and need no reordering; the echoed id turns a framing bug into an error instead of a reply
+  delivered to the wrong caller. gRPC would bring code generation, HTTP/2 and a large dependency
+  tree for six message types.
+
+### D33: Reply encoding
+- **What:** a binary codec for `Event` in the D24 style: a one-byte tag, fields in declaration
+  order, decoding must consume the whole body. Pinned by golden bytes and a round-trip property over
+  generated events. A reply carries every event its command produced, including expiry events of
+  other jobs that the command triggered; the client library picks out the ones about its own op.
+- **Alternatives:** send the D12 text form; filter the events per client on the server.
+- **Why:** the same reasons as D24, and the events are already the exact result of the command
+  (D4). Filtering would need the server to know which events belong to which op, which is the
+  core's business; a few bytes of other jobs' expiry are cheaper than that coupling.
+
+### D34: Waiting for work
+- **What:** `lease` never blocks: it returns `Empty` at once. The worker library retries an empty
+  lease after a jittered delay that starts at 10 ms and doubles to a cap of 1 s, and resets after it
+  gets a job.
+- **Alternatives:** long polling (the server parks the lease until a job is ready or a timeout).
+- **Why:** a parked lease is state outside the queue: it must be woken by the right enqueue, survive
+  nothing across a restart, and later be forwarded to a Raft leader. With D4's pure core, that state
+  would live in the server and be untested by everything built so far. Polling costs at most one
+  wasted request per idle worker per second. Long polling is a Tier 3 item, measured against this.
+
+### D35: Deduplication keys
+- **What:** `enqueue` takes an optional key: 1 to 128 visible ASCII characters. The queue remembers
+  `(queue, key) -> job` for 5 minutes of logical time from the first enqueue (a fixed window, like
+  SQS FIFO deduplication), whether or not the job has since been acked. A repeat inside the window
+  enqueues nothing and returns a `Deduplicated` event with the original job id; the repeat's payload
+  and delay are ignored. Entries expire at the start of every command, at `enqueued_at + 5 min`
+  (exclusive, as leases in D18). The table is part of the state machine: logged with the command,
+  rebuilt on replay, in the snapshot, replicated in M7. On the wire and in the log a keyed enqueue
+  is a new op tag 9 and an unkeyed one keeps tag 1, so every existing log decodes unchanged.
+  Snapshots move to version 2, which appends the table sorted by `(queue, key)`; version 1 still
+  loads (as an empty table). The invariant checker checks the table and its expiry index; the
+  ledger checks that a `Deduplicated` names the job last enqueued with that key.
+- **Alternatives:** a dedup cache in server memory (lost on restart and invisible to replicas);
+  client-side dedup only; keys that live as long as the job.
+- **Why:** the producer's problem is a lost reply: it enqueued, the connection dropped, and it
+  cannot tell whether the job exists. Retrying with the same key is safe only if the queue answers
+  the same way after a crash or a failover, so the table must be in the replicated state, not in a
+  server cache. Keeping the entry after the ack matters: the retry may arrive after a fast worker
+  finished the job, and a second job then would be a duplicate effect. The window bounds memory;
+  5 minutes is SQS's choice and longer than any client retry loop should run. Expiry measured in
+  logical time keeps replay deterministic (D4).
+
+### D36: Worker library
+- **What:** an async `Client` with one connection shared by clones: a writer task assigns request
+  ids and a reader task matches replies to callers in order, so concurrent calls pipeline. Methods
+  `enqueue`, `lease`, `heartbeat`, `ack`, `nack` return typed results; a rejection is an error with
+  its `RejectReason`. `Worker::run(queue, handler)` loops: lease (D34), run the handler while
+  heartbeating every visibility/3, ack on `Ok`, nack on `Err`. If a heartbeat is rejected, the
+  lease is gone (expired and probably leased by someone else), so the handler's future is dropped
+  and nothing is acked.
+- **Alternatives:** a bare client only; a blocking client; one connection per call.
+- **Why:** the heartbeat must run while the handler does, on the same connection, which is what the
+  shared, pipelined client gives. Dropping the handler on a lost lease is the cheapest guard against
+  the zombie worker (D5) inside the process; it cannot undo effects already made, which is what
+  fencing tokens checked downstream are for (M4). Heartbeating at a third of the visibility leaves
+  two heartbeats' worth of slack before the lease can expire.
+
+### D37: Backpressure
+- **What:** the channel to the core thread holds 1024 requests; each connection may have 128
+  requests in flight (sent and not yet answered). A connection that hits either limit stops reading
+  its socket until a slot frees, so TCP flow control pushes back on the client.
+- **Alternatives:** unbounded queues; a "busy" error reply.
+- **Why:** unbounded queues turn overload into memory growth and latency without limit. A busy
+  reply moves the retry loop into every client. Not reading is the standard TCP answer and needs no
+  protocol: a pipelining client simply sees its writes slow down. The per-connection cap stops one
+  client from filling the shared channel ahead of everyone else.
+
+### D38: Disk errors in the server
+- **What:** when `Durable` returns an error, the core thread stops; every pending and later
+  request fails (the client sees the connection close), and `spool serve` exits non-zero. A restart
+  runs recovery (D29).
+- **Alternatives:** a read-only mode; retrying the failed write.
+- **Why:** after a failed write or sync the handle is poisoned (D25) and the in-memory state may be
+  ahead of the disk, so there is nothing safe to serve, not even reads. Crash-only: the one recovery
+  path is the one the crash harness tests at every storage call.
+
+### D39: Tests for the network layer
+- **What:** servers run in-process on `127.0.0.1:0` with a temporary data directory and a clock the
+  test controls, and with both checkers (D19) run by the core thread after every batch. Tested:
+  frame and event codecs (golden bytes, round-trip property, every truncation); the handshake and
+  protocol errors; pipelined requests answered in order; concurrent workers where no job is ever
+  leased twice at once and every job is acked exactly once; dedup across a server restart; lease
+  expiry by moving the test clock; the zombie worker stopped by a rejected heartbeat; backpressure
+  that does not deadlock a client pipelining far past the caps. Worker-crash and fencing tests are
+  M4.
+- **Alternatives:** test only against an external `spool serve` process.
+- **Why:** in-process servers are fast, need no ports or cleanup, and can run the checkers inside
+  the server, so every end-to-end test is also an invariant test. The binary itself is exercised by
+  one smoke test.

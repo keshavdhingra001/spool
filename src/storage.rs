@@ -28,6 +28,38 @@ pub trait Storage {
     fn sync_dir(&mut self) -> io::Result<()>;
 }
 
+/// Lend a storage to a durable queue and keep it afterwards, so a test can
+/// look at the disk after the queue failed or was dropped.
+impl<S: Storage + ?Sized> Storage for &mut S {
+    fn list(&self) -> io::Result<Vec<String>> {
+        (**self).list()
+    }
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        (**self).read(name)
+    }
+    fn create(&mut self, name: &str) -> io::Result<()> {
+        (**self).create(name)
+    }
+    fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        (**self).append(name, data)
+    }
+    fn sync(&mut self, name: &str) -> io::Result<()> {
+        (**self).sync(name)
+    }
+    fn truncate(&mut self, name: &str, len: u64) -> io::Result<()> {
+        (**self).truncate(name, len)
+    }
+    fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
+        (**self).rename(from, to)
+    }
+    fn remove(&mut self, name: &str) -> io::Result<()> {
+        (**self).remove(name)
+    }
+    fn sync_dir(&mut self) -> io::Result<()> {
+        (**self).sync_dir()
+    }
+}
+
 /// A real directory, locked against other processes (D29).
 pub struct FileStorage {
     dir: PathBuf,

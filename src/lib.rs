@@ -16,6 +16,7 @@ pub mod fence;
 pub mod ledger;
 pub mod protocol;
 pub mod queue;
+pub mod raft;
 pub mod reference;
 pub mod retry;
 pub mod scenario;

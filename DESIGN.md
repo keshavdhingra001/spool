@@ -991,3 +991,27 @@ durability, deduplication and effectively-once effects at every batch, every rec
 - **Why:** M5's checks are end to end (no lost or doubled effects, dedup, fencing) and apply
   unchanged to a replicated queue. A small real cluster shows the driver is not simulator-only;
   M10 adds the fault-injecting proxy.
+- **As built:** the flag is `spool serve --id <n> --cluster <id>=<addr>,...`. The simulator also
+  checks that every answer fits its op (`answers()`: the last event is of the op's kind and names
+  its job or key). Each replica's core thread stops when its channel closes: on shutdown the
+  accept loop and every connection drop their senders, so no separate shutdown flag is read.
+- **Planted bugs:** over seeds 0..1000, `reply-before-commit` fails 14 (first at seed 25: an
+  acknowledged enqueue is overwritten by the next leader and its job is gone), `ignore-term-on-reply`
+  8 (first at 22), and the queue's `no-fence` 177 and `no-dedup-key` 815. `ignore-term-on-reply`
+  failed 0 of 5,000 seeds before the answer check existed: the wrong events go to a request the
+  leader kept across a step-down, and by then its client has timed out (250 ms) and dropped that
+  request id, so the end state is still right. Only checking each answer against its op shows it.
+- **Mutation pass:** 18 mutants of the replica, the TCP driver, the cluster client, the server's
+  peer handshake and the simulator's checks (`target/tmp/mut7.py`). The first pass killed 10; new
+  tests killed 5 more (a reused proposal index answered `unknown`, an idle leader kept by
+  heartbeats, automatic keys, batches capped by bytes in a unit test of `take_batch`, a single
+  node refusing peers). One mutant went with the code it changed: the core's shutdown check,
+  which nothing needed (see above). Two survive, accepted: the client ignoring leader hints is
+  only slower, since rotating through the members finds the leader anyway; and switching off the
+  state-agreement check between replicas passes because no planted bug makes replicas diverge
+  (the Raft bugs that would, D64, are pinned in M6, and every bug here diverges answers, not
+  state). It stays as a guard for applying that is not deterministic.
+- **Sweep:** seeds 0..20,000 of the cluster world pass in release mode, in 605 s alone on this
+  laptop (about 30 ms a seed; 1,156 s when sharing the CPU): 13,358,386 entries committed,
+  640,573 completions, 164,517 elections, 48,806 leader crashes, 7,750 proposals replaced by
+  another leader's entry and 247 `unknown` answers.

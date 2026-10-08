@@ -1278,8 +1278,13 @@ pub(super) fn check_final(q: &ReferenceQueue, s: &Shared) -> Result<(), String> 
     }
     let jobs: BTreeSet<JobId> = s.keys.values().copied().collect();
     if c.acked != jobs.len() as u64 {
+        let why = if c.acked > jobs.len() as u64 {
+            "a retry added a job"
+        } else {
+            "a job a producer was told about is gone"
+        };
         return Err(format!(
-            "{} jobs completed for {} keys: a retry added a job",
+            "{} jobs completed for {} keys: {why}",
             c.acked,
             jobs.len()
         ));

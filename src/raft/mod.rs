@@ -13,6 +13,8 @@
 //! conflict hints on rejected appends (D60), and the current-term commit rule
 //! with a no-op entry at the start of every term (D61).
 
+pub mod store;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A node's id within its cluster.

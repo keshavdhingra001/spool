@@ -7,8 +7,11 @@
 //! record  = len:u32 crc:u32 lsn:u64 body                     crc over len, lsn and body
 //! body    = one command (D24), len bytes
 //! ```
+//!
+//! Raft's log (D58) uses the same framing under its own magic, with its own
+//! bodies: see [`crate::raft::store`].
 
-use crate::codec::{decode_command, encode_command};
+use crate::codec::{DecodeError, decode_command, encode_command};
 use crate::command::Command;
 use crate::error::StoreError;
 
@@ -37,10 +40,29 @@ pub(crate) fn parse_lsn_name(name: &str, prefix: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// What tells one kind of log file from another: the queue's segments (D23)
+/// and Raft's log (D58) share the framing and differ only in this.
+pub(crate) struct Format {
+    pub magic: &'static [u8; 8],
+    pub version: u32,
+    /// What the file is, for errors.
+    pub what: &'static str,
+}
+
+const QUEUE: Format = Format {
+    magic: MAGIC,
+    version: VERSION,
+    what: "spool log segment",
+};
+
 pub fn encode_header(first_lsn: u64, out: &mut Vec<u8>) {
+    encode_header_as(&QUEUE, first_lsn, out);
+}
+
+pub(crate) fn encode_header_as(format: &Format, first_lsn: u64, out: &mut Vec<u8>) {
     let start = out.len();
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(format.magic);
+    out.extend_from_slice(&format.version.to_le_bytes());
     out.extend_from_slice(&first_lsn.to_le_bytes());
     let crc = crc32c::crc32c(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
@@ -48,9 +70,14 @@ pub fn encode_header(first_lsn: u64, out: &mut Vec<u8>) {
 
 /// Append one framed record holding `cmd` at `lsn`.
 pub fn encode_record(lsn: u64, cmd: &Command, out: &mut Vec<u8>) {
+    encode_frame(lsn, out, |out| encode_command(cmd, out));
+}
+
+/// Append one framed record at `lsn` whose body `body` writes.
+pub(crate) fn encode_frame(lsn: u64, out: &mut Vec<u8>, body: impl FnOnce(&mut Vec<u8>)) {
     let start = out.len();
     out.extend_from_slice(&[0; RECORD_HEADER_LEN]);
-    encode_command(cmd, out);
+    body(out);
     let len = u32::try_from(out.len() - start - RECORD_HEADER_LEN).expect("record under 4 GiB");
     out[start..start + 4].copy_from_slice(&len.to_le_bytes());
     out[start + 8..start + 16].copy_from_slice(&lsn.to_le_bytes());
@@ -65,17 +92,17 @@ fn record_crc(record: &[u8]) -> u32 {
 
 /// What one segment holds.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Scan {
+pub struct Scan<T = Command> {
     /// False if the file is shorter than a header or its header is damaged
     /// with nothing after it: a crash while the segment was being created.
     pub header: bool,
     /// Every valid record, in order, with its LSN.
-    pub records: Vec<(u64, Command)>,
+    pub records: Vec<(u64, T)>,
     /// Bytes up to the end of the last valid record (or the header).
     pub valid_len: u64,
 }
 
-impl Scan {
+impl<T> Scan<T> {
     /// True if the file has bytes after its valid part: a torn tail.
     pub fn torn(&self, file_len: usize) -> bool {
         self.valid_len < file_len as u64
@@ -87,6 +114,17 @@ impl Scan {
 /// tail, and the caller decides whether this segment may have one. Anything
 /// else wrong is `Corruption`.
 pub fn scan(name: &str, bytes: &[u8], first_lsn: u64) -> Result<Scan, StoreError> {
+    scan_as(&QUEUE, name, bytes, first_lsn, decode_command)
+}
+
+/// [`scan`] for a log of `format` whose bodies `decode` reads.
+pub(crate) fn scan_as<T>(
+    format: &Format,
+    name: &str,
+    bytes: &[u8],
+    first_lsn: u64,
+    decode: impl Fn(&[u8]) -> Result<T, DecodeError>,
+) -> Result<Scan<T>, StoreError> {
     let corrupt = |offset: usize, what: String| StoreError::Corruption {
         file: name.to_string(),
         offset: offset as u64,
@@ -106,11 +144,11 @@ pub fn scan(name: &str, bytes: &[u8], first_lsn: u64) -> Result<Scan, StoreError
             valid_len: 0,
         });
     }
-    if &bytes[..8] != MAGIC {
-        return Err(corrupt(0, "not a spool log segment".into()));
+    if &bytes[..8] != format.magic {
+        return Err(corrupt(0, format!("not a {}", format.what)));
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if version != VERSION {
+    if version != format.version {
         return Err(corrupt(8, format!("unknown log version {version}")));
     }
     let header_lsn = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
@@ -143,9 +181,9 @@ pub fn scan(name: &str, bytes: &[u8], first_lsn: u64) -> Result<Scan, StoreError
         if got != lsn {
             return Err(corrupt(at, format!("record LSN {got}, expected {lsn}")));
         }
-        let cmd = decode_command(&record[RECORD_HEADER_LEN..])
+        let body = decode(&record[RECORD_HEADER_LEN..])
             .map_err(|e| corrupt(at, format!("record {lsn}: {e}")))?;
-        records.push((lsn, cmd));
+        records.push((lsn, body));
         lsn += 1;
         at += end;
     }

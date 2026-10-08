@@ -804,6 +804,36 @@ fn a_late_rejection_never_moves_next_index_forward() {
 }
 
 #[test]
+fn messages_from_outside_the_cluster_are_ignored() {
+    let mut c = Cluster::new(3);
+    c.elect(0);
+    // Node 0 from itself, and both from ids outside 0..3.
+    for (to_self, from) in [(true, 0), (false, 3), (false, 99)] {
+        c.nodes[0].receive(
+            from,
+            Message::AppendReply {
+                term: 1,
+                result: AppendResult::Ok { matched: 1 },
+            },
+        );
+        if to_self {
+            continue;
+        }
+        c.nodes[1].receive(
+            from,
+            Message::Vote {
+                term: 9,
+                last_index: 9,
+                last_term: 9,
+            },
+        );
+    }
+    assert!(c.drain(0).send.is_empty());
+    assert!(c.drain(1).send.is_empty());
+    assert_eq!((c.node(1).term(), c.node(1).vote()), (1, Some(0)));
+}
+
+#[test]
 fn a_single_node_cluster_elects_itself_and_commits_alone() {
     let mut c = Cluster::new(1);
     c.timeout(0);

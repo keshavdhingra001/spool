@@ -436,6 +436,11 @@ impl Node {
     }
 
     pub fn receive(&mut self, from: Id, msg: Message) {
+        if self.peers.binary_search(&from).is_err() {
+            // Not a member: never a vote for it, never a reply to count.
+            self.stats.stale_messages += 1;
+            return;
+        }
         let term = msg.term();
         match msg {
             // A pre-vote changes nothing on its receiver, whatever its term.

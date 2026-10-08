@@ -6,6 +6,9 @@
 //! `spool serve --data <dir> [--listen <addr>]` serves the durable queue over
 //! TCP (M3); `spool connect <addr>` is a REPL against a running server, where
 //! commands are typed without `@<ms>` because the server stamps the time (D31).
+//!
+//! `spool sim --seed <n> [--trace]` runs one seed of the deterministic
+//! simulation (M5) and `spool sim --seeds <a>..<b>` sweeps a range (D55).
 
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
@@ -73,7 +76,88 @@ const USAGE: &str = "\
 usage: spool                                   REPL, in memory
        spool --data <dir>                      REPL, durable
        spool serve --data <dir> [--listen <addr>]   serve over TCP (default 127.0.0.1:7878)
-       spool connect <addr>                    REPL against a server";
+       spool connect <addr>                    REPL against a server
+       spool sim --seed <n> [--trace] [--bug <bug>]     run one simulation seed
+       spool sim --seeds <a>..<b> [--bug <bug>]         sweep seeds, stop at the first failure
+                                               bugs to plant (D54): no-fence, no-dedup-key";
+
+fn usage() -> ! {
+    eprintln!("{USAGE}");
+    std::process::exit(2);
+}
+
+/// `spool sim`: replay one seed or sweep a range (D55). Exits 1 on a failure.
+fn sim(args: &[&str]) -> ! {
+    use spool::sim::queue::{self, Bug};
+    let mut seeds = None;
+    let mut trace = false;
+    let mut bug = None;
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        match (arg, it.clone().next()) {
+            ("--seed", Some(n)) => {
+                let n = n.parse().unwrap_or_else(|_| usage());
+                seeds = Some(n..n + 1);
+                it.next();
+            }
+            ("--seeds", Some(range)) => {
+                let (a, b) = range.split_once("..").unwrap_or_else(|| usage());
+                let a: u64 = a.parse().unwrap_or_else(|_| usage());
+                let b: u64 = b.parse().unwrap_or_else(|_| usage());
+                seeds = Some(a..b);
+                it.next();
+            }
+            ("--trace", _) => trace = true,
+            ("--bug", Some(&"no-fence")) => {
+                bug = Some(Bug::NoFence);
+                it.next();
+            }
+            ("--bug", Some(&"no-dedup-key")) => {
+                bug = Some(Bug::NoDedupKey);
+                it.next();
+            }
+            _ => usage(),
+        }
+    }
+    let seeds = seeds.unwrap_or_else(|| usage());
+    let single = seeds.end - seeds.start == 1;
+    let started = std::time::Instant::now();
+    let mut total = queue::Coverage::default();
+    let mut runs = 0;
+    for seed in seeds {
+        let mut options = queue::Options::new(seed);
+        options.bug = bug;
+        options.trace = trace && single;
+        let result = queue::run(&options);
+        let report = match &result {
+            Ok(r) => r,
+            Err(f) => &*f.report,
+        };
+        if single {
+            for line in &report.trace {
+                println!("{line}");
+            }
+            println!("seed {seed}: {:?}", report.swarm);
+            println!(
+                "  finished after {} ms simulated, trace hash {:016x}",
+                report.finished.0, report.hash
+            );
+            println!("  {:?}", report.world);
+            println!("  {:?}", report.coverage);
+        }
+        if let Err(f) = result {
+            println!("{f}");
+            std::process::exit(1);
+        }
+        total.add(&report.coverage);
+        runs += 1;
+    }
+    if !single {
+        println!("{runs} seeds passed in {:.1?}", started.elapsed());
+        println!("  {total:?}");
+    }
+    std::process::exit(0);
+}
 
 /// Serve until Ctrl-C (exit 0) or until the queue fails (exit 1, D38).
 fn serve(dir: &Path, listen: SocketAddr) -> io::Result<()> {
@@ -160,6 +244,7 @@ fn main() -> io::Result<()> {
             }
         },
         ["connect", addr] => return connect(addr),
+        ["sim", rest @ ..] => sim(rest),
         [] => {
             println!("spool reference queue, in memory. Type `help`.");
             Backend::Memory(Checked::new())

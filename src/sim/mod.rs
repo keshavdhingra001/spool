@@ -11,6 +11,7 @@
 //! [`World::run_until`].
 
 pub mod disk;
+pub mod queue;
 pub mod rng;
 
 use std::cmp::Reverse;
@@ -351,7 +352,8 @@ impl<M: Message> World<M> {
     pub fn pause(&mut self, node: NodeId, until: Time) {
         self.stats.pauses += 1;
         self.nodes[node.0 as usize].paused_until = Some(until);
-        self.record(format_args!("pause {node} until {}", until.0), 6, until.0);
+        let at = until.0 - START.0;
+        self.record(format_args!("pause {node} until {at}"), 6, until.0);
     }
 
     /// Move `node`'s clock by `ms` (negative is back).

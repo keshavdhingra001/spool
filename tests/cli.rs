@@ -1,5 +1,5 @@
 //! Smoke test of the real binary (D39): `spool serve` as a process, killed
-//! with SIGKILL and restarted on the same directory.
+//! with SIGKILL and restarted on the same directory, and `spool sim` (D55).
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -82,4 +82,42 @@ async fn kill_9_and_restart() {
     c.ack(leased.lease.job, leased.lease.token).await.unwrap();
     server.kill().unwrap();
     server.wait().unwrap();
+}
+
+#[test]
+fn sim_replays_a_seed_and_reports_a_failing_one() {
+    let sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_spool"))
+            .arg("sim")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let traced = sim(&["--seed", "4", "--trace"]);
+    assert!(traced.status.success());
+    let text = String::from_utf8(traced.stdout).unwrap();
+    assert!(
+        text.contains("start n0") && text.contains("trace hash"),
+        "{text}"
+    );
+    let hash = |t: &str| {
+        t.lines()
+            .find(|l| l.contains("trace hash"))
+            .unwrap()
+            .to_string()
+    };
+    let plain = String::from_utf8(sim(&["--seed", "4"]).stdout).unwrap();
+    assert_eq!(
+        hash(&text),
+        hash(&plain),
+        "the trace does not change the run"
+    );
+
+    let swept = sim(&["--seeds", "0..20", "--bug", "no-fence"]);
+    assert_eq!(swept.status.code(), Some(1));
+    let text = String::from_utf8(swept.stdout).unwrap();
+    assert!(
+        text.contains("failed") && text.contains("replay: cargo run -- sim --seed"),
+        "{text}"
+    );
 }

@@ -334,8 +334,29 @@ impl fmt::Debug for Msg {
                 value,
             } => write!(f, "#{req} write job={job} token={token} value={value}"),
             Msg::Written { req, ok } => write!(f, "#{req} -> written ok={ok}"),
-            Msg::Raft(m) => write!(f, "{:?}", super::raft::Msg::Raft(m.clone())),
+            Msg::Raft(m) => super::raft::fmt_raft(m, f, batch_text),
         }
+    }
+}
+
+/// A Raft entry of the cluster world: a batch of commands (D66) as
+/// `@at op; op`, the leader's no-op, or bytes that do not decode.
+fn batch_text(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "no-op".into();
+    }
+    match crate::replica::decode_batch(data) {
+        Ok((at, ops)) => {
+            let ops: Vec<String> = ops
+                .into_iter()
+                .map(|op| {
+                    let text = Command { at: Time(0), op }.to_string();
+                    text.trim_start_matches("@0 ").to_string()
+                })
+                .collect();
+            format!("@{at} {}", ops.join("; "))
+        }
+        Err(e) => format!("bad batch ({e}): {}", String::from_utf8_lossy(data)),
     }
 }
 

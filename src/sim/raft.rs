@@ -287,54 +287,66 @@ fn text(data: &[u8]) -> String {
     }
 }
 
+/// A Raft message in a trace, with entry data shown by `text`: strings in
+/// this world, the queue's batches in the cluster world (M7).
+pub(super) fn fmt_raft(
+    m: &raft::Message,
+    f: &mut fmt::Formatter<'_>,
+    text: fn(&[u8]) -> String,
+) -> fmt::Result {
+    use raft::Message as M;
+    match m {
+        M::PreVote {
+            term,
+            last_index,
+            last_term,
+        } => write!(f, "prevote t{term} last={last_index}/t{last_term}"),
+        M::PreVoteReply { term, granted } => {
+            write!(f, "prevote-reply t{term} granted={granted}")
+        }
+        M::Vote {
+            term,
+            last_index,
+            last_term,
+        } => write!(f, "vote t{term} last={last_index}/t{last_term}"),
+        M::VoteReply { term, granted } => {
+            write!(f, "vote-reply t{term} granted={granted}")
+        }
+        M::Append {
+            term,
+            prev_index,
+            prev_term,
+            entries,
+            commit,
+        } => {
+            let es: Vec<String> = entries
+                .iter()
+                .map(|e| format!("t{}:{}", e.term, text(&e.data)))
+                .collect();
+            write!(
+                f,
+                "append t{term} prev={prev_index}/t{prev_term} commit={commit} [{}]",
+                es.join(" ")
+            )
+        }
+        M::AppendReply { term, result } => match result {
+            AppendResult::Ok { matched } => write!(f, "append-ok t{term} matched={matched}"),
+            AppendResult::Reject {
+                prev_index,
+                conflict_term,
+                first_index,
+            } => write!(
+                f,
+                "append-reject t{term} prev={prev_index} conflict={conflict_term:?} first={first_index}"
+            ),
+        },
+    }
+}
+
 impl fmt::Debug for Msg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use raft::Message as M;
         match self {
-            Msg::Raft(M::PreVote {
-                term,
-                last_index,
-                last_term,
-            }) => write!(f, "prevote t{term} last={last_index}/t{last_term}"),
-            Msg::Raft(M::PreVoteReply { term, granted }) => {
-                write!(f, "prevote-reply t{term} granted={granted}")
-            }
-            Msg::Raft(M::Vote {
-                term,
-                last_index,
-                last_term,
-            }) => write!(f, "vote t{term} last={last_index}/t{last_term}"),
-            Msg::Raft(M::VoteReply { term, granted }) => {
-                write!(f, "vote-reply t{term} granted={granted}")
-            }
-            Msg::Raft(M::Append {
-                term,
-                prev_index,
-                prev_term,
-                entries,
-                commit,
-            }) => {
-                let es: Vec<String> = entries
-                    .iter()
-                    .map(|e| format!("t{}:{}", e.term, text(&e.data)))
-                    .collect();
-                write!(
-                    f,
-                    "append t{term} prev={prev_index}/t{prev_term} commit={commit} [{}]",
-                    es.join(" ")
-                )
-            }
-            Msg::Raft(M::AppendReply { term, result }) => match result {
-                AppendResult::Ok { matched } => write!(f, "append-ok t{term} matched={matched}"),
-                AppendResult::Reject {
-                    prev_index,
-                    conflict_term,
-                    first_index,
-                } => write!(
-                    f,
-                    "append-reject t{term} prev={prev_index} conflict={conflict_term:?} first={first_index}"
-                ),
-            },
+            Msg::Raft(m) => fmt_raft(m, f, text),
             Msg::Propose { req, data } => write!(f, "#{req} propose {}", text(data)),
             Msg::Proposed { req, outcome } => write!(f, "#{req} -> {outcome:?}"),
         }

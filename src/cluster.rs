@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::codec;
+use crate::command::Op;
 use crate::protocol::{self, Reply, Request};
 use crate::raft::{Id, Message};
 use crate::replica::{self, Output, Replica, ReplicaError};
@@ -116,11 +117,10 @@ impl<S: Storage + Send + 'static> ClusterServer<S> {
         let (core_tx, core_rx) = mpsc::channel(options.core_queue);
         let (done_tx, done) = oneshot::channel();
         let core_options = options.clone();
-        let core_shutdown = shutdown_rx.clone();
         std::thread::Builder::new()
             .name(format!("spool-core-{}", options.id))
             .spawn(move || {
-                let stopped = core(replica, core_rx, peers, core_shutdown, &core_options);
+                let stopped = core(replica, core_rx, peers, &core_options);
                 let _ = done_tx.send(stopped);
             })?;
         tasks.push(tokio::spawn(accept(
@@ -164,16 +164,17 @@ impl<S: Storage + Send + 'static> ClusterServer<S> {
 type Tag = oneshot::Sender<Reply>;
 
 /// The core thread: owns the replica, batches requests into entries, runs
-/// the timers, until shutdown or until the replica fails. Requests still
-/// waiting for their entry are dropped with the replica, which closes their
-/// connections without an answer: their clients cannot know the outcome
-/// (D70). Unlike the single node's core (D30), this one cannot wait for every
-/// pending reply, since without a quorum some never come.
+/// the timers, until the replica fails or every sender of `rx` is gone. On
+/// shutdown the accept loop stops and each connection drops its sender, so
+/// the channel closing is the shutdown signal. Requests still waiting for
+/// their entry are dropped with the replica, which closes their connections
+/// without an answer: their clients cannot know the outcome (D70). Unlike the
+/// single node's core (D30), this one cannot wait for every pending reply,
+/// since without a quorum some never come.
 fn core<S: Storage>(
     mut replica: Replica<S, Tag>,
     mut rx: mpsc::Receiver<Input>,
     peers: BTreeMap<Id, mpsc::Sender<Message>>,
-    shutdown: watch::Receiver<bool>,
     options: &ClusterOptions,
 ) -> Stopped<S> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -182,41 +183,25 @@ fn core<S: Storage>(
         .expect("a timer runtime");
     let mut timers = Timers::new(options);
     let mut stats = Stats::default();
-    let mut scratch = Vec::new();
     let result = (|| -> Result<(), ServerError> {
         let out = replica.start().map_err(failed)?;
         timers.handle(out, &peers);
         loop {
-            if *shutdown.borrow() {
-                return Ok(());
-            }
             let deadline = timers.heartbeat_at.min(timers.election_at);
             let first =
                 rt.block_on(async { tokio::time::timeout_at(deadline.into(), rx.recv()).await });
             match first {
                 Ok(None) => return Ok(()),
                 Ok(Some(input)) => {
-                    let mut requests = Vec::new();
-                    let mut bytes = 0;
-                    let mut next = Some(input);
-                    while let Some(input) = next.take().or_else(|| rx.try_recv().ok()) {
-                        match input {
-                            Input::Raft(from, msg) => {
-                                let out = replica.receive(from, msg).map_err(failed)?;
-                                timers.handle(out, &peers);
-                            }
-                            Input::Request(job) => {
-                                scratch.clear();
-                                codec::encode_op(&job.op, &mut scratch);
-                                bytes += scratch.len();
-                                requests.push((job.reply, job.op));
-                                if requests.len() >= options.max_batch
-                                    || bytes >= options.max_batch_bytes
-                                {
-                                    break;
-                                }
-                            }
-                        }
+                    let Drained { raft, requests } = take_batch(
+                        input,
+                        || rx.try_recv().ok(),
+                        options.max_batch,
+                        options.max_batch_bytes,
+                    );
+                    for (from, msg) in raft {
+                        let out = replica.receive(from, msg).map_err(failed)?;
+                        timers.handle(out, &peers);
                     }
                     if !requests.is_empty() {
                         stats.batches += 1;
@@ -251,6 +236,49 @@ fn core<S: Storage>(
         stats,
         result,
     }
+}
+
+/// One drain of the core channel: the Raft messages in the order they came,
+/// and the requests for one entry.
+struct Drained {
+    raft: Vec<(Id, Message)>,
+    requests: Vec<(Tag, Op)>,
+}
+
+/// Take `first`, then inputs from `more` while it has some, until the
+/// requests number `max_batch` or their encoded ops reach `max_bytes` (D66).
+/// The request that crosses the byte limit is still taken, so an op larger
+/// than the limit gets an entry of its own instead of never fitting. Raft
+/// messages never end a drain; they are received before the entry is
+/// proposed, as they arrived before it would be.
+fn take_batch(
+    first: Input,
+    mut more: impl FnMut() -> Option<Input>,
+    max_batch: usize,
+    max_bytes: usize,
+) -> Drained {
+    let mut drained = Drained {
+        raft: Vec::new(),
+        requests: Vec::new(),
+    };
+    let mut bytes = 0;
+    let mut scratch = Vec::new();
+    let mut next = Some(first);
+    while let Some(input) = next.take().or_else(&mut more) {
+        match input {
+            Input::Raft(from, msg) => drained.raft.push((from, msg)),
+            Input::Request(job) => {
+                scratch.clear();
+                codec::encode_op(&job.op, &mut scratch);
+                bytes += scratch.len();
+                drained.requests.push((job.reply, job.op));
+                if drained.requests.len() >= max_batch || bytes >= max_bytes {
+                    break;
+                }
+            }
+        }
+    }
+    drained
 }
 
 fn failed(e: ReplicaError) -> ServerError {
@@ -358,5 +386,83 @@ async fn dial(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::Job;
+    use crate::types::{Millis, Payload, QueueName};
+
+    fn request(size: usize) -> Input {
+        let (reply, _) = oneshot::channel();
+        let op = Op::Enqueue {
+            queue: QueueName::new("q").unwrap(),
+            payload: Payload(vec![7; size]),
+            delay: Millis(0),
+            key: None,
+        };
+        Input::Request(Job { op, reply })
+    }
+
+    fn vote() -> Input {
+        let msg = Message::VoteReply {
+            term: 1,
+            granted: true,
+        };
+        Input::Raft(1, msg)
+    }
+
+    /// Drain `inputs` in at most `max_batch` requests and `max_bytes` bytes;
+    /// returns the requests and Raft messages taken, and what is left.
+    fn drain(mut inputs: Vec<Input>, max_batch: usize, max_bytes: usize) -> (usize, usize, usize) {
+        inputs.reverse();
+        let first = inputs.pop().unwrap();
+        let d = take_batch(first, || inputs.pop(), max_batch, max_bytes);
+        (d.requests.len(), d.raft.len(), inputs.len())
+    }
+
+    fn op_bytes(size: usize) -> usize {
+        let Input::Request(job) = request(size) else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        codec::encode_op(&job.op, &mut out);
+        out.len()
+    }
+
+    #[test]
+    fn takes_everything_under_both_caps() {
+        let inputs = vec![request(10), vote(), request(10), vote()];
+        assert_eq!(drain(inputs, 256, 1 << 20), (2, 2, 0));
+    }
+
+    #[test]
+    fn stops_at_max_batch_requests() {
+        let inputs = (0..5).map(|_| request(1)).collect();
+        assert_eq!(drain(inputs, 3, 1 << 20), (3, 0, 2));
+    }
+
+    #[test]
+    fn stops_once_encoded_ops_reach_max_bytes() {
+        let one = op_bytes(100);
+        let inputs = (0..5).map(|_| request(100)).collect();
+        // Two ops stay under the cap, the third reaches it and ends the batch.
+        assert_eq!(drain(inputs, 256, 3 * one), (3, 0, 2));
+        let inputs = (0..5).map(|_| request(100)).collect();
+        assert_eq!(drain(inputs, 256, 2 * one + 1), (3, 0, 2));
+    }
+
+    #[test]
+    fn an_op_over_the_byte_cap_gets_an_entry_of_its_own() {
+        let inputs = vec![request(1000), request(1), request(1)];
+        assert_eq!(drain(inputs, 256, 100), (1, 0, 2));
+    }
+
+    #[test]
+    fn raft_messages_do_not_count_toward_either_cap() {
+        let inputs = vec![vote(), vote(), request(1), vote(), request(1), request(1)];
+        assert_eq!(drain(inputs, 2, 1 << 20), (2, 3, 1));
     }
 }

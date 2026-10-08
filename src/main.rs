@@ -8,7 +8,8 @@
 //! commands are typed without `@<ms>` because the server stamps the time (D31).
 //!
 //! `spool sim --seed <n> [--trace]` runs one seed of the deterministic
-//! simulation (M5) and `spool sim --seeds <a>..<b>` sweeps a range (D55).
+//! simulation (M5) and `spool sim --seeds <a>..<b>` sweeps a range (D55);
+//! `--raft` runs the Raft world (M6) instead of the queue world.
 
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
@@ -79,19 +80,24 @@ usage: spool                                   REPL, in memory
        spool connect <addr>                    REPL against a server
        spool sim --seed <n> [--trace] [--bug <bug>]     run one simulation seed
        spool sim --seeds <a>..<b> [--bug <bug>]         sweep seeds, stop at the first failure
-                                               bugs to plant (D54): no-fence, no-dedup-key";
+                                               bugs to plant (D54): no-fence, no-dedup-key
+       spool sim --raft ...                    the same on the Raft world (M6); bugs (D64):
+                                               vote-not-persisted, commit-old-term,
+                                               no-log-truncate, stale-term-accept";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
     std::process::exit(2);
 }
 
-/// `spool sim`: replay one seed or sweep a range (D55). Exits 1 on a failure.
+/// `spool sim`: replay one seed or sweep a range (D55), of the queue world
+/// (M5) or, with `--raft`, of the Raft world (M6). Exits 1 on a failure.
 fn sim(args: &[&str]) -> ! {
-    use spool::sim::queue::{self, Bug};
+    use spool::sim::{queue, raft};
     let mut seeds = None;
     let mut trace = false;
-    let mut bug = None;
+    let mut on_raft = false;
+    let mut bug: Option<&str> = None;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
         match (arg, it.clone().next()) {
@@ -108,12 +114,9 @@ fn sim(args: &[&str]) -> ! {
                 it.next();
             }
             ("--trace", _) => trace = true,
-            ("--bug", Some(&"no-fence")) => {
-                bug = Some(Bug::NoFence);
-                it.next();
-            }
-            ("--bug", Some(&"no-dedup-key")) => {
-                bug = Some(Bug::NoDedupKey);
+            ("--raft", _) => on_raft = true,
+            ("--bug", Some(name)) => {
+                bug = Some(name);
                 it.next();
             }
             _ => usage(),
@@ -122,8 +125,57 @@ fn sim(args: &[&str]) -> ! {
     let seeds = seeds.unwrap_or_else(|| usage());
     let single = seeds.end - seeds.start == 1;
     let started = std::time::Instant::now();
-    let mut total = queue::Coverage::default();
     let mut runs = 0;
+    if on_raft {
+        use spool::raft::Bug;
+        let bug = bug.map(|b| match b {
+            "vote-not-persisted" => Bug::VoteNotPersisted,
+            "commit-old-term" => Bug::CommitOldTerm,
+            "no-log-truncate" => Bug::NoLogTruncate,
+            "stale-term-accept" => Bug::StaleTermAccept,
+            _ => usage(),
+        });
+        let mut total = raft::Coverage::default();
+        for seed in seeds {
+            let mut options = raft::Options::new(seed);
+            options.bug = bug;
+            options.trace = trace && single;
+            let result = raft::run(&options);
+            let report = match &result {
+                Ok(r) => r,
+                Err(f) => &*f.report,
+            };
+            if single {
+                for line in &report.trace {
+                    println!("{line}");
+                }
+                println!("seed {seed}: {:?}", report.swarm);
+                println!(
+                    "  finished after {} ms simulated, trace hash {:016x}",
+                    report.finished.0, report.hash
+                );
+                println!("  {:?}", report.world);
+                println!("  {:?}", report.coverage);
+            }
+            if let Err(f) = result {
+                println!("{f}");
+                std::process::exit(1);
+            }
+            total.add(&report.coverage);
+            runs += 1;
+        }
+        if !single {
+            println!("{runs} seeds passed in {:.1?}", started.elapsed());
+            println!("  {total:?}");
+        }
+        std::process::exit(0);
+    }
+    let bug = bug.map(|b| match b {
+        "no-fence" => queue::Bug::NoFence,
+        "no-dedup-key" => queue::Bug::NoDedupKey,
+        _ => usage(),
+    });
+    let mut total = queue::Coverage::default();
     for seed in seeds {
         let mut options = queue::Options::new(seed);
         options.bug = bug;

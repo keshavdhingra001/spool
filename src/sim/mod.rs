@@ -12,6 +12,7 @@
 
 pub mod disk;
 pub mod queue;
+pub mod raft;
 pub mod rng;
 
 use std::cmp::Reverse;
@@ -374,6 +375,16 @@ impl<M: Message> World<M> {
         self.record(format_args!("isolate {node}"), 8, u64::from(node.0));
     }
 
+    /// Cut the link from `from` to `to` only: one-way loss (D63).
+    pub fn cut(&mut self, from: NodeId, to: NodeId) {
+        self.cuts.insert((from, to));
+        self.record(
+            format_args!("cut {from}->{to}"),
+            11,
+            u64::from(from.0) << 32 | u64::from(to.0),
+        );
+    }
+
     pub fn heal(&mut self) {
         self.cuts.clear();
         self.record(format_args!("heal"), 9, 0);
@@ -502,6 +513,23 @@ pub fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
 /// FNV-1a of `bytes` from the standard offset.
 pub fn digest(bytes: &[u8]) -> u64 {
     fnv(FNV_OFFSET, bytes)
+}
+
+/// FNV-1a of any hashable value, fed through `Hash`: the same in every run,
+/// unlike a randomly keyed hasher (D48).
+pub fn digest_of<T: std::hash::Hash>(value: &T) -> u64 {
+    struct Fnv(u64);
+    impl std::hash::Hasher for Fnv {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0 = fnv(self.0, bytes);
+        }
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+    let mut h = Fnv(FNV_OFFSET);
+    value.hash(&mut h);
+    std::hash::Hasher::finish(&h)
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Smoke test of the real binary (D39): `spool serve` as a process, killed
-//! with SIGKILL and restarted on the same directory, and `spool sim` (D55).
+//! with SIGKILL and restarted on the same directory, and `spool sim` (D55) on
+//! the queue world and the Raft world.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -119,5 +120,34 @@ fn sim_replays_a_seed_and_reports_a_failing_one() {
     assert!(
         text.contains("failed") && text.contains("replay: cargo run -- sim --seed"),
         "{text}"
+    );
+}
+
+#[test]
+fn sim_raft_replays_a_seed_and_reports_a_planted_bug() {
+    let sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_spool"))
+            .args(["sim", "--raft"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let traced = sim(&["--seed", "4", "--trace"]);
+    assert!(traced.status.success());
+    let text = String::from_utf8(traced.stdout).unwrap();
+    assert!(
+        text.contains("prevote t1") && text.contains("append t") && text.contains("trace hash"),
+        "{text}"
+    );
+    let swept = sim(&["--seeds", "0..20", "--bug", "no-log-truncate"]);
+    assert_eq!(swept.status.code(), Some(1));
+    let text = String::from_utf8(swept.stdout).unwrap();
+    assert!(
+        text.contains("failed") && text.contains("replay: cargo run -- sim --raft --seed"),
+        "{text}"
+    );
+    assert_eq!(
+        sim(&["--seed", "1", "--bug", "nonsense"]).status.code(),
+        Some(2)
     );
 }

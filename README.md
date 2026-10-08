@@ -5,7 +5,7 @@ Postgres underneath), leases with visibility timeouts and fencing tokens, effect
 processing, and (in progress) Raft replication written from scratch and partition testing by
 deterministic simulation.
 
-**Status:** M4, Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
+**Status:** M5. Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
 ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state with redrive
 (M1). Durable (M2): every command goes into a checksummed write-ahead log and is synced before
 its result is returned, with periodic snapshots and recovery that is tested by failing at every
@@ -18,7 +18,11 @@ stores its result in one log record, and is safe to repeat after a lost reply (D
 tokens fence a worker's writes to other stores, so a worker that stalled past its lease cannot
 overwrite newer work (D43). A seeded test kills workers before and after their effects, loses their
 replies and wakes zombies, and checks that every job's effect is the one its completing lease made
-(D46). Tier 1 is done; the deterministic simulator (M5) comes next.
+(D46). Simulated (M5): a deterministic simulator runs the server, its log on a simulated disk, a
+fenced store, producers and workers in one thread from one seed, through lost, duplicated and late
+messages, partitions, crashes, torn writes, pauses and clock jumps, and checks durability,
+deduplication and effectively-once effects at every batch and every recovery (D47–D55). Raft (M6)
+comes next.
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
 ## Design in one paragraph
@@ -106,6 +110,30 @@ completed job=1 token=1
 result job=1 done token=1 payload=receipt-77
 ```
 
+## Simulation
+
+Every run of the simulator follows from one seed (D48): the network's losses and delays, which node
+crashes when, which crash image its disk is left with. A failing seed replays the same events every
+time, so it is a complete bug report:
+
+```
+cargo run --release -- sim --seeds 0..10000          # sweep; stops at the first failure
+cargo run --release -- sim --seed 42 --trace         # replay one seed, printing every event
+```
+
+```
+cargo run --release -- sim --seed 42 --trace
+    2837 recv n4->n1 #169 write job=1 token=1 value=1:1     worker n4's effect reaches the store
+    2847 recv n1->n4 #169 -> written ok=true
+    2848 recv n4->n0 #170 complete 1 1 1:1                  then the complete, with the same token
+    2855 recv n0->n4 #170 -> completed job=1 token=1
+    4627 crash n4 (1 images)
+```
+
+Two bugs can be planted on purpose to show the checks find them (D54): `--bug no-fence` (the store
+accepts a zombie's late write) and `--bug no-dedup-key` (a producer's retry adds a second job). Both
+fail within the first few seeds, with the seed and the replay command in the message.
+
 Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a
 scenario file (D20).
 
@@ -118,7 +146,7 @@ scenario file (D20).
 | M2 | Durability: write-ahead log with CRCs, snapshots, recovery tested by crashing at every byte |
 | M3 | TCP server, binary protocol, worker library, idempotent enqueue |
 | M4 | Effectively-once: fencing tokens end to end, transactional ack, worker-crash tests |
-| M5 | Deterministic simulator: network, disk and clock from one seed, fault injection |
+| M5 | Deterministic simulator: network, disk and clock from one seed, fault injection (done) |
 | M6–M7 | Raft from scratch; the queue on Raft |
 | M8 | Partitioning across Raft groups |
 | M9 | Jepsen-style history checker |

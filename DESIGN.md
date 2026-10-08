@@ -15,7 +15,7 @@ producers / workers ──TCP──> node ────────────�
                          pure, deterministic, logical time ◄─────────────────────┘
 ```
 
-Today (M4): the reference queue (D17) behind the `Queue` trait (D11): leases with visibility
+Today (M5): the reference queue (D17) behind the `Queue` trait (D11): leases with visibility
 timeouts and fencing tokens (D5, D18), retries with capped exponential backoff and deterministic
 jitter (D13) under a per-queue policy (D14), expiry counted as an attempt (D15), a dead-letter state
 with redrive (D16), delayed jobs (D17) and deduplication keys (D35). Time arrives in every command
@@ -26,7 +26,11 @@ thread owns the queue and commits batches with one sync, connections are tokio t
 server stamps the time (D31). A client and worker library (D34, D36) sit on the other side.
 Effectively-once processing holds inside a stated boundary (D40): a transactional complete stores a
 job's result with its ack in one command (D41, D42), and lease tokens fence writes to external
-stores (D43), tested against seeded worker crashes and zombies (D46).
+stores (D43), tested against seeded worker crashes and zombies (D46). A deterministic simulator
+(D47–D55) runs the server's batch logic, its log on a simulated disk, an external fenced store,
+producers and workers as message-driven processes in one thread, from one seed, under lost,
+duplicated and late messages, partitions, crashes, torn writes, pauses and clock jumps, and checks
+durability, deduplication and effectively-once effects at every batch, every recovery and the end.
 
 ## Decisions
 
@@ -736,3 +740,17 @@ stores (D43), tested against seeded worker crashes and zombies (D46).
   --seeds a..b` sweeps a range and prints the first failing seed.
 - **Why:** the fixed range keeps `cargo test` fast and repeatable; the sweep finds new failures;
   the replay is how a failure is debugged, since the same seed gives the same events every time.
+- **Run:** `cargo test` runs 200 seeds (2 producers of 15 jobs, 3 workers) in about 6 s in a debug
+  build. A release sweep of seeds 0..100,000 passed in 568 s on this laptop (about 5.7 ms a seed),
+  reaching 788,707 server recoveries (687,677 from a snapshot, 397,991 that cut a torn tail,
+  411,542 that lost unanswered commands, 22,158 that kept commands whose batch failed before its
+  reply, 14,432 crashes during recovery), 21,533 zombie writes refused by the fence, 319,384
+  completes answered after a resend, 532,814 expired leases and batches of up to 134 requests.
+  The planted bugs fail at seed 3 (`NoFence`) and seed 0 (`NoDedupKey`).
+- **Mutation pass:** 15 mutants, all killed. Of the six in the queue, log and fence, the simulator
+  alone kills four: a reply before the sync, dedup keys never recorded, leases that never expire
+  (as a liveness failure) and results never stored, plus missing fencing. It does not kill
+  "a repeated complete by the same lease is rejected" (D42): in this world that only changes what
+  the worker is told, not any effect, and the unit, scenario and worker-crash tests kill it.
+  Removing heartbeats is caught only by a coverage assertion, not by a correctness check: with
+  fencing, heartbeats are for liveness and wasted work, not for safety, which is the point of D43.

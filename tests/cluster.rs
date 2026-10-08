@@ -212,3 +212,63 @@ async fn with_no_quorum_the_client_gives_up_after_its_retry_time() {
     assert!(started.elapsed() >= Duration::from_millis(600));
     c.stop(leader).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_does_not_wait_for_a_request_that_cannot_commit() {
+    let mut c = Cluster::start().await;
+    let leader = c.leader().await;
+    for id in [0, 1, 2] {
+        if id != leader {
+            c.stop(id).await;
+        }
+    }
+    // Sent at once, before CheckQuorum can depose the leader: it is proposed
+    // and can never commit.
+    let one = Client::connect(c.members[&leader]).await.unwrap();
+    let stuck = tokio::spawn(async move { one.request(Op::Tick).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let server = c.servers.remove(&leader).unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+        .await
+        .expect("shutdown finished");
+    stopped.result.unwrap();
+    // The client learns nothing: its connection closes without an answer.
+    assert!(stuck.await.unwrap().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_cluster_keeps_its_leader() {
+    let mut c = Cluster::start().await;
+    let leader = c.leader().await;
+    // Ten election timeouts with no requests: only heartbeats hold it.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert_eq!(c.leader().await, leader);
+    for id in [0, 1, 2] {
+        c.stop(id).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_requests_are_split_into_entries_that_fit_a_peer_frame() {
+    let mut c = Cluster::start().await;
+    let client = c.client();
+    // 12 enqueues of 700 KB at once: one entry with all of them would be an
+    // 8 MB append, over the 4 MiB peer frame, and would never replicate.
+    let tasks: Vec<_> = (0..12u8)
+        .map(|i| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .enqueue(&q(), Payload(vec![i; 700_000]), Millis(0), None)
+                    .await
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+    for id in [0, 1, 2] {
+        let s = c.stop(id).await;
+        let _ = s;
+    }
+}

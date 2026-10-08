@@ -511,3 +511,44 @@ async fn read_reply(stream: &mut TcpStream) -> Result<Reply, ClientError> {
         .reply()
         .map_err(|e| ClientError::Protocol(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cluster_client_keys_every_unkeyed_enqueue_once() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let c = Client::cluster(BTreeMap::from([(0, addr)]), Duration::from_secs(1));
+        let Mode::Cluster(router) = &c.mode else {
+            panic!("a cluster client");
+        };
+        let enqueue = |key: Option<&str>| Op::Enqueue {
+            queue: QueueName::new("q").unwrap(),
+            payload: Payload(vec![]),
+            delay: Millis(0),
+            key: key.map(|k| DedupKey::new(k).unwrap()),
+        };
+        let key = |op: Op| match op {
+            Op::Enqueue { key, .. } => key,
+            other => panic!("{other:?}"),
+        };
+        let a = key(router.keyed(enqueue(None))).expect("a key");
+        let b = key(router.keyed(enqueue(None))).expect("a key");
+        assert_ne!(a, b, "every enqueue its own key");
+        assert_eq!(
+            key(router.keyed(enqueue(Some("mine")))),
+            DedupKey::new("mine").ok()
+        );
+        assert_eq!(router.keyed(Op::Tick), Op::Tick);
+        let other = Client::cluster(BTreeMap::from([(0, addr)]), Duration::from_secs(1));
+        let Mode::Cluster(other) = &other.mode else {
+            panic!()
+        };
+        assert_ne!(
+            key(other.keyed(enqueue(None))).unwrap(),
+            a,
+            "clients never share keys"
+        );
+    }
+}

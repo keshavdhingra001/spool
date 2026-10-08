@@ -522,6 +522,31 @@ mod tests {
         }
     }
 
+    /// n0 proposes at 2, 3 and 4 in term 1, reaching nobody; n1 wins term 2
+    /// and its no-op cuts n0's log back to 2 entries; n0 wins term 3, its
+    /// no-op takes index 3 and its next proposal index 4. The request pending
+    /// at 4 since term 1 can never apply: it is answered at once.
+    #[test]
+    fn a_request_at_an_index_proposed_again_is_answered_unknown() {
+        let mut c = Cluster::new();
+        c.elect(0);
+        for tag in [1, 2, 3] {
+            let out = c.replicas[0]
+                .propose(Time(10), vec![(tag, enqueue(tag as u8))])
+                .unwrap();
+            assert!(out.replies.is_empty());
+        }
+        let _ = c.replicas[2].election_timeout().unwrap();
+        c.elect(1);
+        assert_eq!(c.replicas[0].node().last_index(), 2, "n0's tail was cut");
+        let _ = c.replicas[2].election_timeout().unwrap();
+        c.elect(0);
+        let out = c.replicas[0]
+            .propose(Time(20), vec![(4, enqueue(4))])
+            .unwrap();
+        assert_eq!(out.replies, [(3, Reply::Unknown)]);
+    }
+
     #[test]
     fn reply_before_commit_answers_from_the_leaders_own_log() {
         let mut c = Cluster::new();

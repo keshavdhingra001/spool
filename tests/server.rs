@@ -68,7 +68,10 @@ async fn handshake_and_protocol_errors() {
     let refused = async |bytes: Vec<u8>, code: ErrorCode| {
         let mut s = TcpStream::connect(addr).await.unwrap();
         s.write_all(&bytes).await.unwrap();
-        match read(&mut s).await.unwrap().reply().unwrap() {
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), read(&mut s))
+            .await
+            .expect("an answer");
+        match first.unwrap().reply().unwrap() {
             Reply::Error { code: c, message } => assert_eq!(c, code, "{message}"),
             other => panic!("expected an error, got {other:?}"),
         }
@@ -80,6 +83,18 @@ async fn handshake_and_protocol_errors() {
     )
     .await;
     refused(frames(&[(1, Request::Op(op("tick")))]), ErrorCode::Protocol).await;
+    // Only a cluster replica takes Raft peers (M7).
+    refused(
+        frames(&[(
+            1,
+            Request::Peer {
+                version: 2,
+                from: 0,
+            },
+        )]),
+        ErrorCode::Protocol,
+    )
+    .await;
     // A length over the cap, refused before reading the body.
     refused(
         (protocol::MAX_FRAME + 1).to_le_bytes().to_vec(),

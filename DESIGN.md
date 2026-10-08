@@ -754,3 +754,101 @@ durability, deduplication and effectively-once effects at every batch, every rec
   the worker is told, not any effect, and the unit, scenario and worker-crash tests kill it.
   Removing heartbeats is caught only by a coverage assertion, not by a correctness check: with
   fencing, heartbeats are for liveness and wasted work, not for safety, which is the point of D43.
+
+### D56: Raft shape: a pure node driven by inputs and outputs
+- **What:** `spool::raft::Node` is a state machine with no I/O. It takes inputs (`Tick`, a
+  `Message` from a peer, `Propose` from a client) and returns outputs: `Persist` (records to make
+  durable), `Send` (messages to peers), `Apply` (committed entries in order) and
+  `ResetElectionTimer`. The driver performs `Persist` before any `Send` from the same step. In the
+  simulator a thin adapter makes the node a `Process<RaftMsg>` over a `SimDisk`; in M7 and M10 the
+  real server drives the same node.
+- **Alternatives:** write Raft directly as a simulator process; adopt an existing Raft crate.
+- **Why:** the queue core (D4) and `server::Core` (D47) already work this way, and it is what lets
+  one implementation run both in the simulator and in the real server. A node that cannot do I/O
+  cannot depend on timing or interleavings the simulator does not control. This is the etcd
+  "ready" style, written from the paper rather than taken from a crate, because the point of M6
+  is to own every line of it.
+
+### D57: Raft features in M6
+- **What:** leader election, log replication, the commit rule (D61), persistence of term, vote and
+  log, plus PreVote and CheckQuorum. PreVote: a node that has not heard from a leader first asks
+  whether it could win before raising its term. CheckQuorum: a leader that has not heard from a
+  majority within an election timeout steps down.
+- **Alternatives:** core Raft only; core Raft with snapshots and membership changes now.
+- **Why:** without PreVote, a node isolated by a partition keeps raising its term and forces a
+  needless election when it rejoins; without CheckQuorum, a leader cut off from the majority keeps
+  accepting proposals it can never commit. Both turn swarm partitions into liveness failures that
+  look like bugs. Log compaction (snapshots) and membership changes are Tier 3; linearizable reads
+  (ReadIndex) belong to the queue on Raft (M7).
+
+### D58: Raft's durable state: one write-ahead log
+- **What:** each node keeps one log file in the `wal.rs` format (length + CRC records, D26) with
+  three record types: `HardState { term, vote }`, `Append { index, entries }` and
+  `Truncate { from }`. Recovery replays the file to rebuild term, vote and log. A torn tail is cut
+  as in D26. The rule: a `HardState` or `Append` is synced before any message that depends on it
+  is sent (a vote, a successful append reply, a leader's own count of itself).
+- **Alternatives:** a separate hard-state file replaced atomically by rename, next to a log file.
+- **Why:** one file reuses the record format and the crash-image testing already proven in M2 and
+  M5, and recovery has one place to read. A rename-swapped file adds a second durability path with
+  its own crash cases for two integers.
+
+### D59: Election timeouts come from the driver
+- **What:** the node outputs `ResetElectionTimer`; the driver picks the timeout and later feeds a
+  `Tick`. The simulator draws it uniformly from 150–300 ms with the world's generator; the real
+  server uses the OS. The leader heartbeats every 50 ms.
+- **Alternatives:** the node draws its own random timeout.
+- **Why:** randomness is what breaks split votes, but D4 keeps it out of the core. Moving the draw
+  to the driver keeps the node deterministic for a given sequence of inputs, which makes unit
+  tests of the node exact.
+
+### D60: Replication: conflict hints and bounded appends
+- **What:** a follower that rejects an append replies with a hint `(conflict_term,
+  first_index_of_that_term)` (or its log length if too short); the leader jumps `next_index` back
+  past the whole term in one step. An append carries at most 64 entries.
+- **Alternatives:** step `next_index` back by one entry per rejection (the basic paper rule).
+- **Why:** a follower that missed a long stretch catches up in about one round trip per
+  conflicting term instead of one per entry, which matters under message loss. The cap keeps a
+  message small enough for the datagram model (D49).
+
+### D61: The commit rule and the leader's no-op
+- **What:** a leader advances the commit index only to an entry of its current term stored on a
+  majority; earlier entries commit with it. A new leader appends an empty entry of its term at
+  once.
+- **Why:** an entry from an older term can sit on a majority and still be overwritten by a later
+  leader (Figure 8 of the Raft paper), so counting replicas is only safe for current-term entries.
+  The no-op lets a new leader commit everything before it without waiting for a client. A planted
+  bug (D64) breaks this rule.
+
+### D62: What a Raft run checks
+- **What:** live, after every event: at most one leader per term (election safety); two logs that
+  share an index and term are identical up to it (log matching); every entry the checker has seen
+  committed is in the log of each later leader (leader completeness); all nodes apply the same
+  entries in the same order (state machine safety). One global ledger of committed entries in the
+  checker survives node crashes, so a committed entry lost by recovery fails the run. At the end,
+  after faults heal: a leader exists, and every proposal a client saw acknowledged is applied on
+  every node, within a deadline.
+- **Why:** these are the safety properties of Figure 3 of the paper plus durability and liveness;
+  checking them at every event points at the step that broke them.
+
+### D63: Cluster sizes and faults
+- **What:** each seed picks a cluster of 3 or 5 nodes and a swarm mix (D52): drop, duplication,
+  delay spikes, partitions including one-way cuts, pauses, crashes with crash images, torn writes
+  and failing disk calls. A node whose disk call fails halts, like the server (D38), and restarts
+  from its disk.
+- **Why:** a paused leader that wakes with a stale term, a one-way cut that hides a leader from
+  one follower, and a crash between persisting and sending are the cases Raft gets wrong in
+  practice; one-way cuts are what exercise PreVote and CheckQuorum.
+
+### D64: Planted bugs for Raft
+- **What:** `vote-not-persisted`, `commit-old-term` (breaks D61), `no-log-truncate` (a follower
+  keeps conflicting entries after an append) and `stale-term-accept` (a node acts on a message
+  from an older term). A test asserts each fails within a bound of seeds with the expected check.
+- **Why:** each breaks a different safety argument, as D54 does for the queue; mutation passes
+  cover the rest of the code.
+
+### D65: The workload
+- **What:** clients propose numbered operations to the node they think is leader, follow
+  redirects and retry on timeout. The applied state is the list of applied operations.
+- **Why:** the simplest workload that still exposes a lost or duplicated commit. A retried
+  proposal may legitimately be applied twice here; deduplicating retries is the queue's job in M7,
+  through its dedup keys (D35).

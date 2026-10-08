@@ -262,6 +262,59 @@ fn one_vote_per_term_and_only_for_an_up_to_date_log() {
     assert!(r.persist.is_empty());
 }
 
+/// Nodes 0 and 1 both campaign in term 1; node 2 votes for node 0, crashes
+/// right after, restarts from its disk and is asked by node 1. Returns the
+/// roles of nodes 0 and 1 at the end.
+fn split_vote_with_a_crash_between(bug: Option<Bug>) -> (Role, Role) {
+    let mut c = Cluster::with_bug(3, bug);
+    c.timeout(0);
+    c.timeout(1);
+    // Node 2 grants both pre-votes; nodes 0 and 1 do not hear each other.
+    c.deliver_if(|from, to, m| {
+        matches!(m, Message::PreVote { .. } | Message::PreVoteReply { .. })
+            && (from == 2 || to == 2)
+    });
+    assert_eq!(c.node(0).role(), Role::Candidate);
+    assert_eq!(c.node(1).role(), Role::Candidate);
+    // Their first vote requests were lost; they ask again on the next tick.
+    c.heartbeat(0);
+    c.heartbeat(1);
+    // Node 2 gets node 0's vote request first; node 1's waits.
+    let late: Vec<_> = c
+        .inflight
+        .iter()
+        .filter(|(from, to, _)| *from == 1 && *to == 2)
+        .cloned()
+        .collect();
+    // (Node 0's first append, which would make node 2's log newer than
+    // node 1's, is lost.)
+    c.deliver_if(|from, to, m| {
+        matches!(m, Message::Vote { .. } | Message::VoteReply { .. })
+            && ((from == 0 && to == 2) || (from == 2 && to == 0))
+    });
+    assert_eq!(c.node(0).role(), Role::Leader);
+    // Node 2 crashes and restarts from what it saved.
+    let members = [0, 1, 2];
+    c.nodes[2] = Node::new(2, &members, c.saved[2].clone()).with_bug(bug);
+    c.drain(2);
+    c.inflight.extend(late);
+    c.deliver_if(|from, to, _| (from == 1 && to == 2) || (from == 2 && to == 1));
+    (c.node(0).role(), c.node(1).role())
+}
+
+#[test]
+fn a_vote_survives_a_crash_so_a_term_has_one_leader() {
+    assert_eq!(
+        split_vote_with_a_crash_between(None),
+        (Role::Leader, Role::Candidate)
+    );
+    assert_eq!(
+        split_vote_with_a_crash_between(Some(Bug::VoteNotPersisted)),
+        (Role::Leader, Role::Leader),
+        "the planted bug lets the restarted node vote twice in term 1"
+    );
+}
+
 #[test]
 fn with_the_vote_bug_a_granted_vote_is_not_written() {
     let mut n = restored(0, 3, 4, Vec::new()).with_bug(Some(Bug::VoteNotPersisted));
@@ -495,7 +548,12 @@ fn figure_8(bug: Option<Bug>) -> Node {
         );
     }
     assert_eq!((leader.role(), leader.term()), (Role::Leader, 4));
-    assert_eq!(leader.log().len(), 3, "the no-op of term 4 is entry 3");
+    let no_op = bug != Some(Bug::CommitOldTerm);
+    assert_eq!(
+        leader.log().len(),
+        if no_op { 3 } else { 2 },
+        "the no-op of term 4 is entry 3"
+    );
     leader.take_ready();
     // Node 1 had entry 2; node 2 now gets it but not the no-op.
     for v in [1, 2] {
@@ -640,6 +698,72 @@ fn a_stale_rejection_does_not_move_next_index() {
         r.send.is_empty(),
         "nothing resent: it answered an older append"
     );
+}
+
+#[test]
+fn candidates_ask_again_whoever_has_not_granted() {
+    let mut c = Cluster::new(5);
+    c.timeout(0);
+    // Nodes 1 and 2 grant the pre-vote; only node 1's vote gets through.
+    c.deliver_if(|from, to, m| {
+        let pair = |set: &[Id]| set.contains(&from) && set.contains(&to);
+        match m {
+            Message::PreVote { .. } | Message::PreVoteReply { .. } => pair(&[0, 1, 2]),
+            _ => pair(&[0, 1]),
+        }
+    });
+    assert_eq!(c.node(0).role(), Role::Candidate);
+    c.heartbeat(0);
+    let resent: Vec<Id> = c.inflight.iter().map(|(_, to, _)| *to).collect();
+    assert_eq!(resent, [2, 3, 4]);
+    assert!(
+        c.inflight
+            .iter()
+            .all(|(_, _, m)| matches!(m, Message::Vote { term: 1, .. }))
+    );
+    c.inflight.clear();
+    c.heartbeat(1);
+    assert!(
+        c.inflight.is_empty(),
+        "followers send nothing on a heartbeat tick"
+    );
+    c.heartbeat(0);
+    c.deliver();
+    assert_eq!(c.node(0).role(), Role::Leader);
+}
+
+#[test]
+fn only_progress_starts_another_append() {
+    let mut c = Cluster::new(3);
+    c.elect(0);
+    c.inflight.clear();
+    for i in 0..100 {
+        c.propose(0, &format!("e{i}")).unwrap();
+    }
+    c.inflight.clear();
+    let ok = |matched| Message::AppendReply {
+        term: 1,
+        result: AppendResult::Ok { matched },
+    };
+    // Node 1 has the no-op (entry 1) and is behind: an ack that moves it on
+    // gets the next batch...
+    c.nodes[0].receive(1, ok(2));
+    assert_eq!(c.drain(0).send.len(), 1);
+    // ...and the same ack again, or an older one, gets nothing.
+    c.nodes[0].receive(1, ok(2));
+    c.nodes[0].receive(1, ok(1));
+    assert!(c.drain(0).send.is_empty());
+    // A rejection that cannot move next_index back sends nothing either.
+    let reject = |prev_index| Message::AppendReply {
+        term: 1,
+        result: AppendResult::Reject {
+            prev_index,
+            conflict_term: None,
+            first_index: 1,
+        },
+    };
+    c.nodes[0].receive(1, reject(2));
+    assert!(c.drain(0).send.is_empty());
 }
 
 #[test]

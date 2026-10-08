@@ -179,7 +179,8 @@ pub enum Bug {
     /// A granted vote is not written to disk, so after a crash the node can
     /// vote again in the same term.
     VoteNotPersisted,
-    /// A leader counts replicas for entries of earlier terms too (breaks D61).
+    /// A leader appends no no-op when elected and counts replicas for entries
+    /// of earlier terms too: both halves of D61 gone.
     CommitOldTerm,
     /// A follower keeps its entries that conflict with the leader's.
     NoLogTruncate,
@@ -380,11 +381,38 @@ impl Node {
     }
 
     /// The heartbeat interval passed: a leader sends every follower an append,
-    /// which is a heartbeat if the follower is up to date.
+    /// which is a heartbeat if the follower is up to date. A pre-candidate or
+    /// candidate asks again the peers that have not granted, since requests
+    /// and replies can be lost (the paper's RPCs are retried).
     pub fn heartbeat(&mut self) {
-        if matches!(self.state, State::Leader(_)) {
-            for to in self.peers.clone() {
-                self.send_append(to);
+        let (granted, msg) = match &self.state {
+            State::Follower => return,
+            State::Leader(_) => {
+                for to in self.peers.clone() {
+                    self.send_append(to);
+                }
+                return;
+            }
+            State::PreCandidate { granted } => (
+                granted.clone(),
+                Message::PreVote {
+                    term: self.term + 1,
+                    last_index: self.last_index(),
+                    last_term: self.last_term(),
+                },
+            ),
+            State::Candidate { granted } => (
+                granted.clone(),
+                Message::Vote {
+                    term: self.term,
+                    last_index: self.last_index(),
+                    last_term: self.last_term(),
+                },
+            ),
+        };
+        for &to in &self.peers {
+            if !granted.contains(&to) {
+                self.ready.send.push((to, msg.clone()));
             }
         }
     }
@@ -585,7 +613,9 @@ impl Node {
         self.leader = Some(self.id);
         self.ready.reset_election_timer = true;
         // The no-op of D61: committing it commits everything before it.
-        self.append_own(Vec::new());
+        if self.bug != Some(Bug::CommitOldTerm) {
+            self.append_own(Vec::new());
+        }
         for to in self.peers.clone() {
             self.send_append(to);
         }
@@ -703,12 +733,16 @@ impl Node {
         match result {
             AppendResult::Ok { matched } => {
                 let m = progress.matched.get_mut(&from).expect("a peer");
+                let advanced = matched > *m;
                 *m = (*m).max(matched);
                 let next = progress.next.get_mut(&from).expect("a peer");
                 *next = (*next).max(matched + 1);
                 let behind = *next <= self.log.len() as u64;
                 self.maybe_commit();
-                if behind {
+                // Follow up only on progress: a duplicate or late reply
+                // starts nothing, so each chain of appends ends (heartbeats
+                // resend what is lost).
+                if advanced && behind {
                     self.send_append(from);
                 }
             }
@@ -737,7 +771,9 @@ impl Node {
                     self.stats.hint_jumps += 1;
                 }
                 self.progress_mut().next.insert(from, new_next);
-                self.send_append(from);
+                if new_next < next {
+                    self.send_append(from);
+                }
             }
         }
     }

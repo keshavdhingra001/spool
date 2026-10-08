@@ -747,9 +747,9 @@ durability, deduplication and effectively-once effects at every batch, every rec
   reply, 14,432 crashes during recovery), 21,533 zombie writes refused by the fence, 319,384
   completes answered after a resend, 532,814 expired leases and batches of up to 134 requests.
   The planted bugs fail at seed 3 (`NoFence`) and seed 0 (`NoDedupKey`).
-- **Mutation pass:** 15 mutants, all killed. Of the six in the queue, log and fence, the simulator
-  alone kills four: a reply before the sync, dedup keys never recorded, leases that never expire
-  (as a liveness failure) and results never stored, plus missing fencing. It does not kill
+- **Mutation pass:** 15 mutants, all killed. Of the six in the queue, log and fence, the simulator's
+  tests kill five on their own: a reply before the sync, dedup keys never recorded, leases that
+  never expire (as a liveness failure), results never stored and missing fencing. It does not kill
   "a repeated complete by the same lease is rejected" (D42): in this world that only changes what
   the worker is told, not any effect, and the unit, scenario and worker-crash tests kill it.
   Removing heartbeats is caught only by a coverage assertion, not by a correctness check: with

@@ -900,3 +900,80 @@ durability, deduplication and effectively-once effects at every batch, every rec
 - **Why:** the simplest workload that still exposes a lost or duplicated commit. A retried
   proposal may legitimately be applied twice here; deduplicating retries is the queue's job in M7,
   through its dedup keys (D35).
+
+### D66: A Raft entry is one server batch
+- **What:** the leader drains up to 256 requests (D30), stamps them with one time read (D31) and
+  proposes them as one entry: `at:u64 count:u32 op*` in the op encoding of D24. Every replica applies
+  an entry's commands in order at that time. The leader's empty no-op (D61) applies nothing.
+- **Alternatives:** one command per entry.
+- **Why:** group commit survives replication: one Raft round (one sync on each replica) is shared by
+  every request in the batch, as one sync was in M3. The time travels inside the entry, so every
+  replica computes the same state without reading a clock (D4).
+
+### D67: The Raft log is the queue's only log
+- **What:** a replicated node keeps one file, the Raft log (D58). The queue lives in memory; after
+  a restart it starts empty and is rebuilt by applying entries as the node learns they are
+  committed. The M2 write-ahead log and snapshots stay for the single-node server.
+- **Alternatives:** keep the queue's own WAL and snapshots and record the last applied index.
+- **Why:** one durability path instead of two that must agree after every crash. The cost: replay
+  time grows with the log until log compaction (Raft snapshots, Tier 3).
+
+### D68: Time across leader changes
+- **What:** nothing new. A new leader whose clock is behind stamps earlier times; the queue clock
+  clamps them (D9) and stands still until the leader's clock catches up. Lease deadlines are judged
+  by whichever leader stamps the next batch.
+- **Alternatives:** a replicated clock entry, or leader leases bounded by clock drift.
+- **Why:** D9 already makes a step back safe, and every replica applies the same stamped time, so
+  skew between nodes shifts when leases expire but never makes replicas disagree.
+
+### D69: Reads go through the log
+- **What:** every op, including `result`, is proposed and answered when it applies. There is no
+  read path that bypasses the log.
+- **Alternatives:** ReadIndex (leader confirms leadership with a heartbeat round, then reads);
+  leader leases (read locally, relying on bounded clock drift).
+- **Why:** almost every queue op writes (a lease changes state), so a read fast path would serve
+  only `result`. Through the log a read is linearizable with no second mechanism. ReadIndex is
+  left for M11 if benchmarks show reads matter.
+
+### D70: A reply belongs to the entry, index and term
+- **What:** the leader remembers, for each entry it proposed, the index, the term and the
+  requests in it. When that index applies with that term, each request gets its events. If another
+  entry applies there, or the node stops leading, each request gets `unknown` and the client
+  retries.
+- **Alternatives:** reply when the leader has appended the entry.
+- **Why:** an entry is the proposer's only if it is applied with the proposer's term (D65); the
+  index alone can be reused by a later leader. A reply before commit would acknowledge writes a
+  new leader may overwrite.
+
+### D71: Redirects
+- **What:** protocol version 2 adds two replies: `not_leader` with the leader's id if known, and
+  `unknown` (the outcome is not known; retry). A node that is not the leader answers `not_leader`.
+  The cluster client knows every node's address by id, follows a hint, and otherwise tries the next
+  node after a backoff. Servers accept versions 1 and 2; only a cluster sends the new replies.
+- **Alternatives:** followers forward requests to the leader.
+- **Why:** forwarding would make each follower track outcomes for requests it did not propose;
+  redirects keep one place (the leader) that answers, and every hop is visible in tests.
+
+### D72: Retries rely on each op being safe to retry
+- **What:** after `unknown`, a timeout or a lost connection, the cluster client resends the same op.
+  It gives every enqueue without a key a fresh dedup key (D35), so a retried enqueue never adds a
+  second job. `complete` is idempotent per lease (D42). `heartbeat` renews again. A retried `lease`
+  may lease a second job; the first lease is orphaned and expires after its visibility timeout.
+- **Alternatives:** client sessions (Raft thesis 6.3): a per-client table of the last request id
+  and reply in the state machine, giving exactly-once for every op.
+- **Why:** it reuses what exists. The cost is stated: an orphaned lease delays its job by one
+  visibility timeout and spends one attempt (D15), so a job near its limit can reach the dead-letter
+  queue early; a retried `ack` or `nack` that had in fact applied comes back rejected. Workers that
+  use `complete` (D41) are unaffected.
+
+### D73: How M7 is built and checked
+- **What:** (1) `replica::Replica`: one Raft node, its log and the queue, with no I/O of its own
+  beyond the log, driven the way `raft::Node` is. (2) a simulator world with the M5 producers,
+  workers and fenced store against a 3- or 5-node cluster under the M6 faults, checked by the M5
+  end checks plus state-machine agreement between replicas. (3) a real TCP transport between peers,
+  `spool serve --id --peers`, and a three-process test. Planted bugs: `reply-before-commit` and
+  `ignore-term-on-reply`.
+- **Alternatives:** simulator only, with real processes left to M10.
+- **Why:** M5's checks are end to end (no lost or doubled effects, dedup, fencing) and apply
+  unchanged to a replicated queue. A small real cluster shows the driver is not simulator-only;
+  M10 adds the fault-injecting proxy.

@@ -133,6 +133,10 @@ impl<S: Storage> RaftLog<S> {
     pub fn storage(&self) -> &S {
         &self.storage
     }
+
+    pub fn into_storage(self) -> S {
+        self.storage
+    }
 }
 
 fn encode(record: &Record, out: &mut Vec<u8>) {

@@ -8,6 +8,7 @@
 
 pub mod check;
 pub mod client;
+pub mod cluster;
 pub mod codec;
 pub mod command;
 pub mod durable;

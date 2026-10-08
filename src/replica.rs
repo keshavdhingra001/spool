@@ -160,6 +160,10 @@ impl<S: Storage, T> Replica<S, T> {
         self.log.storage()
     }
 
+    pub fn into_storage(self) -> S {
+        self.log.into_storage()
+    }
+
     /// Whatever the node asked for since it was opened (its first election
     /// timer).
     pub fn start(&mut self) -> Result<Output<T>, ReplicaError> {

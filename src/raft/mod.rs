@@ -22,6 +22,9 @@ pub type Id = u32;
 
 /// Entries sent in one append at most (D60).
 pub const MAX_APPEND: usize = 64;
+/// Bytes of entry data in one append at most, unless its first entry alone is
+/// larger (D60): keeps a peer frame bounded.
+pub const MAX_APPEND_BYTES: usize = 1 << 20;
 
 /// One log entry. Empty `data` is the no-op a leader appends when it is
 /// elected (D61); clients propose non-empty data.
@@ -812,7 +815,16 @@ impl Node {
         let next = self.progress().next[&to];
         let prev_index = next - 1;
         let end = (prev_index as usize + MAX_APPEND).min(self.log.len());
-        let entries = self.log[prev_index as usize..end].to_vec();
+        let mut bytes = 0;
+        let entries: Vec<Entry> = self.log[prev_index as usize..end]
+            .iter()
+            .take_while(|e| {
+                let first = bytes == 0;
+                bytes += e.data.len().max(1);
+                first || bytes <= MAX_APPEND_BYTES
+            })
+            .cloned()
+            .collect();
         self.stats.largest_append = self.stats.largest_append.max(entries.len() as u64);
         let msg = Message::Append {
             term: self.term,

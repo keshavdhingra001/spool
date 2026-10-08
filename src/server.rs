@@ -31,6 +31,7 @@ use crate::durable::{Durable, Options, Recovery};
 use crate::error::StoreError;
 use crate::ledger::Ledger;
 use crate::protocol::{self, ErrorCode, FrameError, Reply, Request};
+use crate::raft;
 use crate::storage::{FileStorage, Storage};
 use crate::types::Time;
 
@@ -132,9 +133,16 @@ pub struct Stopped<S> {
 }
 
 /// One request on its way to the core thread.
-struct Job {
-    op: Op,
-    reply: oneshot::Sender<Vec<Event>>,
+pub(crate) struct Job {
+    pub(crate) op: Op,
+    pub(crate) reply: oneshot::Sender<Reply>,
+}
+
+/// What reaches a core thread: a client's request, or (in a cluster, M7) a
+/// message from another replica.
+pub(crate) enum Input {
+    Request(Job),
+    Raft(raft::Id, raft::Message),
 }
 
 pub struct Server<S: Storage = FileStorage> {
@@ -175,7 +183,13 @@ impl<S: Storage + Send + 'static> Server<S> {
                 let _ = done_tx.send(core(core_state, core_rx, &core_options));
             })?;
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let accept = tokio::spawn(accept(listener, core_tx, options.in_flight, shutdown_rx));
+        let accept = tokio::spawn(accept(
+            listener,
+            core_tx,
+            options.in_flight,
+            false,
+            shutdown_rx,
+        ));
         Ok(Server {
             addr,
             shutdown,
@@ -270,19 +284,20 @@ impl<S: Storage> Core<S> {
 /// out is what tells the connections to close.
 fn core<S: Storage>(
     mut core: Core<S>,
-    mut rx: mpsc::Receiver<Job>,
+    mut rx: mpsc::Receiver<Input>,
     options: &ServerOptions,
 ) -> Stopped<S> {
     let mut batch = Vec::with_capacity(options.max_batch);
     let result = loop {
-        let Some(first) = rx.blocking_recv() else {
+        // A single node accepts no peers, so only requests arrive.
+        let Some(Input::Request(first)) = rx.blocking_recv() else {
             break Ok(());
         };
         batch.push(first);
         while batch.len() < options.max_batch {
             match rx.try_recv() {
-                Ok(job) => batch.push(job),
-                Err(_) => break,
+                Ok(Input::Request(job)) => batch.push(job),
+                _ => break,
             }
         }
         // One clock read per batch (D31): every command in it runs at one time.
@@ -293,7 +308,7 @@ fn core<S: Storage>(
         };
         for (job, events) in batch.drain(..).zip(events) {
             // The client may have gone; its reply has nowhere to go.
-            let _ = job.reply.send(events);
+            let _ = job.reply.send(Reply::Events(events));
         }
     };
     drop(rx);
@@ -317,10 +332,13 @@ fn check<S: Storage>(
     agree(durable.queue().counts(), ledger.counts())
 }
 
-async fn accept(
+/// Accept connections until shutdown. With `cluster`, a connection may also
+/// be a peer replica's (M7).
+pub(crate) async fn accept(
     listener: TcpListener,
-    core: mpsc::Sender<Job>,
+    core: mpsc::Sender<Input>,
     in_flight: usize,
+    cluster: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut connections = tokio::task::JoinSet::new();
@@ -334,6 +352,7 @@ async fn accept(
                         stream,
                         core.clone(),
                         in_flight,
+                        cluster,
                         shutdown.clone(),
                     ));
                 }
@@ -352,13 +371,21 @@ async fn accept(
 /// thread has applied the request.
 enum Pending {
     Now(u64, Reply),
-    Later(u64, oneshot::Receiver<Vec<Event>>),
+    Later(u64, oneshot::Receiver<Reply>),
+}
+
+/// How a connection introduced itself.
+enum Greeted {
+    No,
+    Client,
+    Peer(raft::Id),
 }
 
 async fn connection(
     stream: TcpStream,
-    core: mpsc::Sender<Job>,
+    core: mpsc::Sender<Input>,
     in_flight: usize,
+    cluster: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let (mut rd, mut wr) = stream.into_split();
@@ -369,7 +396,7 @@ async fn connection(
             let (id, reply) = match p {
                 Pending::Now(id, reply) => (id, reply),
                 Pending::Later(id, rx) => match rx.await {
-                    Ok(events) => (id, Reply::Events(events)),
+                    Ok(reply) => (id, reply),
                     // The core thread stopped (D38): close without a reply.
                     Err(_) => break,
                 },
@@ -385,17 +412,25 @@ async fn connection(
     });
     let error = |id, code, message: String| Pending::Now(id, Reply::Error { code, message });
 
-    // The handshake: the first frame must be a hello for our version.
+    // The handshake: the first frame must be a hello for a version we speak,
+    // or, in a cluster, a peer's introduction.
     let first = tokio::select! {
         _ = shutdown.changed() => None,
         f = protocol::read_frame(&mut rd) => Some(f),
     };
     let greeted = match first {
         Some(Ok(Some(frame))) => match frame.request() {
-            Ok(Request::Hello { version }) if protocol::speaks(version) => pending
-                .send(Pending::Now(frame.id, Reply::HelloOk { version }))
-                .await
-                .is_ok(),
+            Ok(Request::Hello { version }) if protocol::speaks(version) => {
+                let hello_ok = Pending::Now(frame.id, Reply::HelloOk { version });
+                if pending.send(hello_ok).await.is_ok() {
+                    Greeted::Client
+                } else {
+                    Greeted::No
+                }
+            }
+            Ok(Request::Peer { version, from }) if cluster && protocol::speaks(version) => {
+                Greeted::Peer(from)
+            }
             Ok(Request::Hello { version }) => {
                 let message = format!(
                     "protocol version {version}, server speaks 1 to {}",
@@ -404,31 +439,40 @@ async fn connection(
                 let _ = pending
                     .send(error(frame.id, ErrorCode::UnsupportedVersion, message))
                     .await;
-                false
+                Greeted::No
             }
-            Ok(Request::Op(_)) => {
+            Ok(Request::Peer { version, .. }) if cluster => {
+                let message = format!("peer protocol version {version}");
+                let _ = pending
+                    .send(error(frame.id, ErrorCode::UnsupportedVersion, message))
+                    .await;
+                Greeted::No
+            }
+            Ok(_) => {
                 let message = "the first frame must be hello".to_string();
                 let _ = pending
                     .send(error(frame.id, ErrorCode::Protocol, message))
                     .await;
-                false
+                Greeted::No
             }
             Err(e) => {
                 let _ = pending
                     .send(error(frame.id, ErrorCode::Protocol, e.to_string()))
                     .await;
-                false
+                Greeted::No
             }
         },
         Some(Err(e)) => {
             refuse(&pending, e).await;
-            false
+            Greeted::No
         }
-        _ => false,
+        _ => Greeted::No,
     };
 
-    if greeted {
-        requests(&mut rd, &pending, &core, &mut shutdown).await;
+    match greeted {
+        Greeted::Client => requests(&mut rd, &pending, &core, &mut shutdown).await,
+        Greeted::Peer(from) => peer(&mut rd, from, &core, &mut shutdown).await,
+        Greeted::No => {}
     }
     drop(core);
     drop(pending);
@@ -440,7 +484,7 @@ async fn connection(
 async fn requests(
     rd: &mut tokio::net::tcp::OwnedReadHalf,
     pending: &mpsc::Sender<Pending>,
-    core: &mpsc::Sender<Job>,
+    core: &mpsc::Sender<Input>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let error = |id, code, message: String| Pending::Now(id, Reply::Error { code, message });
@@ -459,8 +503,8 @@ async fn requests(
         };
         let op = match frame.request() {
             Ok(Request::Op(op)) => op,
-            Ok(Request::Hello { .. }) => {
-                let message = "hello sent twice".to_string();
+            Ok(_) => {
+                let message = "only requests after the hello".to_string();
                 let _ = pending
                     .send(error(frame.id, ErrorCode::Protocol, message))
                     .await;
@@ -479,10 +523,34 @@ async fn requests(
             break;
         };
         let (reply, rx) = oneshot::channel();
-        if core.send(Job { op, reply }).await.is_err() {
+        if core.send(Input::Request(Job { op, reply })).await.is_err() {
             break; // The core thread stopped (D38).
         }
         slot.send(Pending::Later(frame.id, rx));
+    }
+}
+
+/// Read Raft messages from a peer that dialed us and hand them to the core
+/// thread. Nothing is answered on this connection: replies go out on the one
+/// this replica dialed. Anything unexpected closes it; the peer redials.
+async fn peer(
+    rd: &mut tokio::net::tcp::OwnedReadHalf,
+    from: raft::Id,
+    core: &mpsc::Sender<Input>,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    loop {
+        let frame = tokio::select! {
+            _ = shutdown.changed() => break,
+            f = protocol::read_frame_max(rd, protocol::MAX_PEER_FRAME) => f,
+        };
+        let Ok(Some(frame)) = frame else { break };
+        let Ok(Request::Raft(msg)) = frame.request() else {
+            break;
+        };
+        if core.send(Input::Raft(from, msg)).await.is_err() {
+            break;
+        }
     }
 }
 

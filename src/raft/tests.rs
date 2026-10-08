@@ -516,6 +516,25 @@ fn a_short_follower_catches_up_in_bounded_appends() {
     assert_eq!(c.node(0).stats().largest_append, MAX_APPEND as u64);
 }
 
+#[test]
+fn appends_are_bounded_by_bytes_too() {
+    let mut c = Cluster::new(3);
+    c.elect(0);
+    c.inflight.clear();
+    let big = "x".repeat(400 << 10);
+    let huge = "y".repeat(2 << 20);
+    for data in [&big, &big, &big, &huge, &big] {
+        c.propose(0, data).unwrap();
+        c.deliver_if(|_, to, _| to != 2);
+    }
+    c.heartbeat(0);
+    c.deliver();
+    assert_eq!(c.node(2).log(), c.node(0).log());
+    // Node 2 has the no-op. Two 400 KiB entries fit in 1 MiB, a third does
+    // not; the 2 MiB entry still goes, alone.
+    assert_eq!(c.node(0).stats().largest_append, 2);
+}
+
 /// Figure 8 of the paper. Node 0 led term 2 and got entry 2 onto nodes 0 and
 /// 1; node 4 led term 3 with its own entry 2. Node 0 leads again in term 4
 /// and copies its entry 2 onto node 2: a majority holds it, but it is not of

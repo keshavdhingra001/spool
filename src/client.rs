@@ -5,10 +5,21 @@
 //! oldest pending request, checking the id (D32). Calls from many tasks
 //! therefore pipeline over one connection, which is what lets a worker
 //! heartbeat while its handler is still waiting on another call.
+//!
+//! [`Client::cluster`] talks to a replicated queue (M7): it keeps one
+//! connection to the replica it believes leads, follows `not_leader` hints,
+//! moves to the next replica when there is no hint or the connection breaks,
+//! and resends after `unknown` (D71, D72). Every enqueue without a key gets a
+//! fresh one, so a resent enqueue never adds a second job (D35, D72). An
+//! attempt that gets no answer within [`ATTEMPT`] counts as a broken
+//! connection: a leader cut off from its quorum never answers.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -33,9 +44,18 @@ pub enum ClientError {
     /// The queue refused the command.
     #[error("rejected: {0}")]
     Rejected(RejectReason),
+    /// The node is a replica that does not lead (D71).
+    #[error("not the leader (leader: {0:?})")]
+    NotLeader(Option<u32>),
+    /// The request may or may not have applied (D70).
+    #[error("outcome unknown")]
+    Unknown,
 }
 
 type ReplyTx = oneshot::Sender<Result<Vec<Event>, ClientError>>;
+
+/// How long a cluster client waits for one attempt's answer.
+pub const ATTEMPT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct Pending {
@@ -47,6 +67,18 @@ struct Pending {
 
 #[derive(Clone)]
 pub struct Client {
+    mode: Mode,
+}
+
+#[derive(Clone)]
+enum Mode {
+    One(Conn),
+    Cluster(Arc<Router>),
+}
+
+/// One connection's request queue.
+#[derive(Clone)]
+struct Conn {
     requests: mpsc::Sender<(Op, ReplyTx)>,
 }
 
@@ -67,7 +99,37 @@ pub struct Leased {
 }
 
 impl Client {
+    /// One connection to one server. Errors are returned as they happen.
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Client, ClientError> {
+        Ok(Client {
+            mode: Mode::One(Conn::connect(addr).await?),
+        })
+    }
+
+    /// A client of the replicated queue whose replicas are `members`, by
+    /// Raft id. It connects on the first request and retries as the module
+    /// says for up to `retry_for`; the last error is returned after that.
+    pub fn cluster(members: BTreeMap<u32, SocketAddr>, retry_for: Duration) -> Client {
+        assert!(!members.is_empty(), "a cluster has members");
+        let target = *members.keys().next().unwrap();
+        Client {
+            mode: Mode::Cluster(Arc::new(Router {
+                members,
+                retry_for,
+                current: Mutex::new(Current {
+                    target,
+                    conn: None,
+                    generation: 0,
+                }),
+                keys: key_prefix(),
+                next_key: AtomicU64::new(0),
+            })),
+        }
+    }
+}
+
+impl Conn {
+    async fn connect(addr: impl ToSocketAddrs) -> Result<Conn, ClientError> {
         let mut stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         let mut hello = Vec::new();
@@ -135,11 +197,16 @@ impl Client {
                         break Some(ClientError::Protocol(e));
                     }
                     Ok(Reply::Events(events)) => Ok(events),
+                    Ok(Reply::NotLeader { leader }) => Err(ClientError::NotLeader(leader)),
+                    Ok(Reply::Unknown) => Err(ClientError::Unknown),
                     Ok(Reply::Error { message, .. }) => Err(ClientError::Server(message)),
                     Ok(other) => Err(ClientError::Protocol(format!("unexpected {other:?}"))),
                     Err(e) => Err(ClientError::Protocol(e.to_string())),
                 };
-                let fatal = result.is_err();
+                let fatal = matches!(
+                    result,
+                    Err(ClientError::Server(_) | ClientError::Protocol(_))
+                );
                 let _ = reply.send(result);
                 if fatal {
                     break None;
@@ -154,18 +221,162 @@ impl Client {
                 })));
             }
         });
-        Ok(Client { requests })
+        Ok(Conn { requests })
     }
 
-    /// Send one op and return every event its command produced (D33),
-    /// including expiry events of other jobs.
-    pub async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
+    async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
         let (tx, rx) = oneshot::channel();
         self.requests
             .send((op, tx))
             .await
             .map_err(|_| ClientError::Closed)?;
         rx.await.map_err(|_| ClientError::Closed)?
+    }
+}
+
+/// The cluster client's view: which replica it sends to, over which
+/// connection. `generation` counts changes of target, so that of several
+/// callers that saw the same connection fail, only the first moves on.
+struct Router {
+    members: BTreeMap<u32, SocketAddr>,
+    retry_for: Duration,
+    current: Mutex<Current>,
+    keys: String,
+    next_key: AtomicU64,
+}
+
+struct Current {
+    target: u32,
+    conn: Option<Conn>,
+    generation: u64,
+}
+
+/// A prefix no other client shares: the clock, the process and a counter of
+/// clients in this process.
+fn key_prefix() -> String {
+    static CLIENTS: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = CLIENTS.fetch_add(1, Ordering::Relaxed);
+    format!("auto-{nanos:x}-{:x}-{n:x}", std::process::id())
+}
+
+impl Router {
+    /// Give an unkeyed enqueue its own key (D72).
+    fn keyed(&self, op: Op) -> Op {
+        match op {
+            Op::Enqueue {
+                queue,
+                payload,
+                delay,
+                key: None,
+            } => {
+                let n = self.next_key.fetch_add(1, Ordering::Relaxed);
+                let key = DedupKey::new(&format!("{}-{n:x}", self.keys)).expect("a valid key");
+                Op::Enqueue {
+                    queue,
+                    payload,
+                    delay,
+                    key: Some(key),
+                }
+            }
+            op => op,
+        }
+    }
+
+    /// The connection to the current target, dialed if there is none.
+    async fn conn(&self) -> Result<(u64, u32, Conn), (u64, ClientError)> {
+        let (generation, target) = {
+            let cur = self.current.lock().unwrap();
+            if let Some(conn) = &cur.conn {
+                return Ok((cur.generation, cur.target, conn.clone()));
+            }
+            (cur.generation, cur.target)
+        };
+        let conn = Conn::connect(self.members[&target])
+            .await
+            .map_err(|e| (generation, e))?;
+        let mut cur = self.current.lock().unwrap();
+        if cur.generation == generation && cur.conn.is_none() {
+            cur.conn = Some(conn.clone());
+        }
+        Ok((generation, target, conn))
+    }
+
+    /// Move on from the target of `generation`: to `leader` if it is a
+    /// member, else to the next replica.
+    fn retarget(&self, generation: u64, leader: Option<u32>) {
+        let mut cur = self.current.lock().unwrap();
+        if cur.generation != generation {
+            return; // someone else moved on already
+        }
+        cur.target = match leader.filter(|l| self.members.contains_key(l)) {
+            Some(l) => l,
+            None => self
+                .members
+                .range(cur.target + 1..)
+                .next()
+                .or_else(|| self.members.iter().next())
+                .map(|(&id, _)| id)
+                .unwrap(),
+        };
+        cur.conn = None;
+        cur.generation += 1;
+    }
+
+    async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
+        let op = self.keyed(op);
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(10);
+        loop {
+            let error = match self.conn().await {
+                Ok((generation, target, conn)) => match tokio::time::timeout(
+                    ATTEMPT.min(self.retry_for),
+                    conn.request(op.clone()),
+                )
+                .await
+                .unwrap_or(Err(ClientError::Closed))
+                {
+                    Ok(events) => return Ok(events),
+                    Err(ClientError::NotLeader(Some(l))) if l != target => {
+                        // A named leader: go there now.
+                        self.retarget(generation, Some(l));
+                        continue;
+                    }
+                    Err(
+                        e @ (ClientError::NotLeader(_) | ClientError::Closed | ClientError::Io(_)),
+                    ) => {
+                        self.retarget(generation, None);
+                        e
+                    }
+                    // Same replica, after a pause: it may know more by then.
+                    Err(ClientError::Unknown) => ClientError::Unknown,
+                    Err(e) => return Err(e),
+                },
+                Err((generation, e)) => {
+                    self.retarget(generation, None);
+                    e
+                }
+            };
+            if started.elapsed() >= self.retry_for {
+                return Err(error);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(500));
+        }
+    }
+}
+
+impl Client {
+    /// Send one op and return every event its command produced (D33),
+    /// including expiry events of other jobs. A cluster client retries as
+    /// the module says.
+    pub async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
+        match &self.mode {
+            Mode::One(conn) => conn.request(op).await,
+            Mode::Cluster(router) => router.request(op).await,
+        }
     }
 
     /// The event about the op itself: always the last one, after any expiry
@@ -185,6 +396,9 @@ impl Client {
         delay: Millis,
         key: Option<DedupKey>,
     ) -> Result<Enqueued, ClientError> {
+        // A cluster client keys every enqueue; only a caller's key can make
+        // an enqueue a duplicate in the caller's eyes.
+        let keyed = key.is_some();
         let op = Op::Enqueue {
             queue: queue.clone(),
             payload,
@@ -198,7 +412,7 @@ impl Client {
             }),
             Event::Deduplicated { job, .. } => Ok(Enqueued {
                 job,
-                deduplicated: true,
+                deduplicated: keyed,
             }),
             other => Err(unexpected(other)),
         }

@@ -6,6 +6,9 @@
 //! `spool serve --data <dir> [--listen <addr>]` serves the durable queue over
 //! TCP (M3); `spool connect <addr>` is a REPL against a running server, where
 //! commands are typed without `@<ms>` because the server stamps the time (D31).
+//! With `--id <n> --cluster 0=<addr>,1=<addr>,...` the server is replica `n`
+//! of a replicated queue (M7), and `spool connect --cluster ...` follows its
+//! leader.
 //!
 //! `spool sim --seed <n> [--trace]` runs one seed of the deterministic
 //! simulation (M5) and `spool sim --seeds <a>..<b>` sweeps a range (D55);
@@ -16,7 +19,11 @@ use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use spool::client::Client;
+use spool::cluster::{ClusterOptions, ClusterServer};
 use spool::server::{Server, ServerOptions};
 
 use spool::storage::FileStorage;
@@ -78,7 +85,10 @@ const USAGE: &str = "\
 usage: spool                                   REPL, in memory
        spool --data <dir>                      REPL, durable
        spool serve --data <dir> [--listen <addr>]   serve over TCP (default 127.0.0.1:7878)
+       spool serve --data <dir> --id <n> --cluster <id>=<addr>,...
+                                               serve as replica n of a cluster (M7)
        spool connect <addr>                    REPL against a server
+       spool connect --cluster <id>=<addr>,... REPL against a cluster
        spool sim --seed <n> [--trace] [--bug <bug>]     run one simulation seed
        spool sim --seeds <a>..<b> [--bug <bug>]         sweep seeds, stop at the first failure
                                                bugs to plant (D54): no-fence, no-dedup-key
@@ -295,17 +305,77 @@ fn serve(dir: &Path, listen: SocketAddr) -> io::Result<()> {
     })
 }
 
-/// A REPL that sends each op to a server and prints the events it caused.
-fn connect(addr: &str) -> io::Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let client = match rt.block_on(Client::connect(addr)) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("cannot connect to {addr}: {e}");
-            std::process::exit(1);
-        }
+/// `0=127.0.0.1:7001,1=...`: every replica of a cluster by id.
+fn members(spec: &str) -> BTreeMap<u32, SocketAddr> {
+    let parse = |part: &str| -> Option<(u32, SocketAddr)> {
+        let (id, addr) = part.split_once('=')?;
+        Some((id.parse().ok()?, addr.parse().ok()?))
     };
-    println!("connected to {addr}. Commands as in `help`, without `@<ms>`.");
+    let members: Option<BTreeMap<u32, SocketAddr>> = spec.split(',').map(parse).collect();
+    match members {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            eprintln!("bad cluster {spec}: expected <id>=<addr>,...");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Serve as replica `id` until Ctrl-C (exit 0) or until it fails (exit 1).
+fn serve_cluster(dir: &Path, id: u32, members: BTreeMap<u32, SocketAddr>) -> io::Result<()> {
+    let Some(&listen) = members.get(&id) else {
+        eprintln!("replica {id} is not in the cluster");
+        std::process::exit(2);
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let started = async {
+            let storage = FileStorage::open(dir)?;
+            let listener = tokio::net::TcpListener::bind(listen).await?;
+            let server = ClusterServer::start(storage, listener, ClusterOptions::new(id, members))
+                .await
+                .map_err(io::Error::other)?;
+            io::Result::Ok(server)
+        };
+        let mut server = match started.await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot serve {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        };
+        println!("replica {id} listening on {}", server.local_addr());
+        io::stdout().flush()?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                let stopped = server.shutdown().await;
+                eprintln!("shut down: {:?}", stopped.stats);
+                stopped.result.map_err(io::Error::other)
+            }
+            stopped = server.stopped() => {
+                let e = stopped.result.err().map_or("stopped".to_string(), |e| e.to_string());
+                eprintln!("fatal: {e}; restart to recover");
+                std::process::exit(1);
+            }
+        }
+    })
+}
+
+/// A REPL that sends each op to a server, or to a cluster's leader, and
+/// prints the events it caused.
+fn connect(target: &str) -> io::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let client = match target.strip_prefix("cluster:") {
+        Some(spec) => Client::cluster(members(spec), Duration::from_secs(10)),
+        None => match rt.block_on(Client::connect(target)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("cannot connect to {target}: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    println!("connected to {target}. Commands as in `help`, without `@<ms>`.");
     let stdin = io::stdin();
     loop {
         print!("> ");
@@ -345,6 +415,11 @@ fn main() -> io::Result<()> {
                 std::process::exit(2);
             }
         },
+        ["serve", "--data", dir, "--id", id, "--cluster", spec] => {
+            let id = id.parse().unwrap_or_else(|_| usage());
+            return serve_cluster(Path::new(dir), id, members(spec));
+        }
+        ["connect", "--cluster", spec] => return connect(&format!("cluster:{spec}")),
         ["connect", addr] => return connect(addr),
         ["sim", rest @ ..] => sim(rest),
         [] => {

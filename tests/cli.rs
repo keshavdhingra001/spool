@@ -1,6 +1,7 @@
 //! Smoke test of the real binary (D39): `spool serve` as a process, killed
-//! with SIGKILL and restarted on the same directory, and `spool sim` (D55) on
-//! the queue world and the Raft world.
+//! with SIGKILL and restarted on the same directory; three `spool serve
+//! --cluster` processes (M7) losing their leader to SIGKILL; and `spool sim`
+//! (D55) on the queue, Raft and cluster worlds.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -83,6 +84,99 @@ async fn kill_9_and_restart() {
     c.ack(leased.lease.job, leased.lease.token).await.unwrap();
     server.kill().unwrap();
     server.wait().unwrap();
+}
+
+/// Three replicas as processes on free ports: SIGKILL the leader, keep
+/// working with the other two, restart it on its directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_three_process_cluster_survives_kill_9_of_its_leader() {
+    use spool::client::ClientError;
+    use spool::{Op, ResultStatus};
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli_cluster");
+    let _ = std::fs::remove_dir_all(&base);
+    // Free ports: bound and released at once, so a rare collision is possible.
+    let members: BTreeMap<u32, std::net::SocketAddr> = (0..3)
+        .map(|id| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            (id, l.local_addr().unwrap())
+        })
+        .collect();
+    let spec: Vec<String> = members.iter().map(|(id, a)| format!("{id}={a}")).collect();
+    let spec = spec.join(",");
+    let start = |id: u32| {
+        let dir = base.join(format!("n{id}"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_spool"))
+            .args(["serve", "--data", dir.to_str().unwrap(), "--id"])
+            .arg(id.to_string())
+            .args(["--cluster", &spec])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(
+            line.starts_with(&format!("replica {id} listening on")),
+            "{line:?}"
+        );
+        child
+    };
+    let mut children: BTreeMap<u32, Child> = (0..3).map(|id| (id, start(id))).collect();
+    let leader = || async {
+        loop {
+            for (&id, addr) in &members {
+                let Ok(c) = Client::connect(addr).await else {
+                    continue;
+                };
+                match c.request(Op::Tick).await {
+                    Ok(_) => return id,
+                    Err(ClientError::NotLeader(_) | ClientError::Unknown | ClientError::Closed) => {
+                    }
+                    Err(e) => panic!("n{id}: {e}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let queue = QueueName::new("q").unwrap();
+    let client = Client::cluster(members.clone(), Duration::from_secs(10));
+    let a = client
+        .enqueue(&queue, Payload(b"a".to_vec()), Millis(0), None)
+        .await
+        .unwrap();
+    let old = tokio::time::timeout(Duration::from_secs(10), leader())
+        .await
+        .unwrap();
+    let mut killed = children.remove(&old).unwrap();
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+    let b = client
+        .enqueue(&queue, Payload(b"b".to_vec()), Millis(0), None)
+        .await
+        .unwrap();
+    children.insert(old, start(old));
+    for (job, payload) in [(a.job, &b"a"[..]), (b.job, b"b")] {
+        let leased = client.lease(&queue, Millis(60_000)).await.unwrap().unwrap();
+        assert_eq!((leased.lease.job, &leased.payload.0[..]), (job, payload));
+        client
+            .complete(job, leased.lease.token, Payload(b"ok".to_vec()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.result(job).await.unwrap(),
+            ResultStatus::Done { .. }
+        ));
+    }
+    for (_, mut child) in children {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 #[test]

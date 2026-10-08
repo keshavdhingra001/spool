@@ -228,6 +228,12 @@ impl MemStorage {
         self
     }
 
+    /// From now on, let `n` more mutating calls succeed and fail the rest, as
+    /// [`MemStorage::fail_after`] does: how the simulator tears a write (D50).
+    pub fn fail_in(&mut self, n: u64) {
+        self.fail_after = Some(self.calls + n);
+    }
+
     /// Mutating calls made so far.
     pub fn calls(&self) -> u64 {
         self.calls

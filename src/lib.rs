@@ -20,6 +20,7 @@ pub mod reference;
 pub mod retry;
 pub mod scenario;
 pub mod server;
+pub mod sim;
 pub mod storage;
 pub mod types;
 pub mod wal;

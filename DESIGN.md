@@ -938,11 +938,15 @@ durability, deduplication and effectively-once effects at every batch, every rec
 ### D70: A reply belongs to the entry, index and term
 - **What:** the leader remembers, for each entry it proposed, the index, the term and the
   requests in it. When that index applies with that term, each request gets its events. If another
-  entry applies there, or the node stops leading, each request gets `unknown` and the client
-  retries.
+  entry applies there, each request gets `unknown` and the client retries. A leader that steps
+  down keeps its pending requests: the next leader may still commit the entry, and the answer then
+  is the real one. Requests pending in a replica that restarts are lost with it; their clients
+  time out and retry.
 - **Alternatives:** reply when the leader has appended the entry.
 - **Why:** an entry is the proposer's only if it is applied with the proposer's term (D65); the
-  index alone can be reused by a later leader. A reply before commit would acknowledge writes a
+  index alone can be reused by a later leader. Keeping requests across a step-down is also what
+  makes the term check carry weight: answering `unknown` at every step-down would hide a missing
+  term check, since a replaced entry is only ever applied after its proposer stopped leading. A reply before commit would acknowledge writes a
   new leader may overwrite.
 
 ### D71: Redirects

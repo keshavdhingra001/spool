@@ -286,6 +286,10 @@ impl Node {
         self
     }
 
+    pub fn set_bug(&mut self, bug: Option<Bug>) {
+        self.bug = bug;
+    }
+
     pub fn id(&self) -> Id {
         self.id
     }

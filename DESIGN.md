@@ -909,6 +909,10 @@ durability, deduplication and effectively-once effects at every batch, every rec
 - **Why:** group commit survives replication: one Raft round (one sync on each replica) is shared by
   every request in the batch, as one sync was in M3. The time travels inside the entry, so every
   replica computes the same state without reading a clock (D4).
+- **As built:** a batch also stops at 1 MiB of encoded ops, and an append at 1 MiB of entry data
+  past its first entry (amending D60), so a peer frame stays under 4 MiB. Every op goes through
+  the log (D69), idle workers' lease polls included: 20,000 simulated seeds committed 13,358,386
+  entries for 640,573 completions. Batching keeps that one sync per batch; M11 measures it.
 
 ### D67: The Raft log is the queue's only log
 - **What:** a replicated node keeps one file, the Raft log (D58). The queue lives in memory; after
@@ -957,6 +961,12 @@ durability, deduplication and effectively-once effects at every batch, every rec
 - **Alternatives:** followers forward requests to the leader.
 - **Why:** forwarding would make each follower track outcomes for requests it did not propose;
   redirects keep one place (the leader) that answers, and every hop is visible in tests.
+- **As built:** peers use the same port: a connection whose first frame is `peer` (version, id)
+  carries `raft` frames one way and is never answered. Each replica sends only on connections it
+  dialed (one task per peer, redialing every 100 ms) and receives on the ones its peers dialed; a
+  full outgoing queue drops the message, which Raft resends. A leader cut off from its quorum
+  never answers, so the cluster client gives each attempt 1 s before it counts the connection
+  as broken and moves on; it retries for a time the caller chooses.
 
 ### D72: Retries rely on each op being safe to retry
 - **What:** after `unknown`, a timeout or a lost connection, the cluster client resends the same op.

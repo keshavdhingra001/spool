@@ -227,6 +227,7 @@ async fn shutdown_does_not_wait_for_a_request_that_cannot_commit() {
     let one = Client::connect(c.members[&leader]).await.unwrap();
     let stuck = tokio::spawn(async move { one.request(Op::Tick).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!stuck.is_finished(), "answered early: {:?}", stuck.await);
     let server = c.servers.remove(&leader).unwrap();
     let stopped = tokio::time::timeout(Duration::from_secs(5), server.shutdown())
         .await

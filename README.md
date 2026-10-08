@@ -3,9 +3,9 @@
 A distributed task queue in Rust, built from the bottom up: its own broker and storage (no Redis or
 Postgres underneath), leases with visibility timeouts and fencing tokens, effectively-once
 processing, partition testing by deterministic simulation, and Raft replication written from
-scratch (the queue moves onto it in M7).
+scratch.
 
-**Status:** M6. Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
+**Status:** M7. Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
 ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state with redrive
 (M1). Durable (M2): every command goes into a checksummed write-ahead log and is synced before
 its result is returned, with periodic snapshots and recovery that is tested by failing at every
@@ -25,8 +25,12 @@ deduplication and effectively-once effects at every batch and every recovery (D4
 a pure Raft node with PreVote, CheckQuorum, conflict hints and the current-term commit rule, its
 log in the same checksummed format, run in the simulator as clusters of 3 or 5 under the same
 faults plus one-way cuts and crashes right after a sync, and checked live for election safety,
-log matching, leader completeness and state machine safety (D56–D65). The queue on Raft (M7)
-comes next.
+log matching, leader completeness and state machine safety (D56–D65). Replicated (M7): the queue
+runs on that Raft, one server batch per log entry, every op (reads too) answered only once its
+entry commits with the term it was proposed in; followers redirect, and the cluster client follows
+leaders and retries, giving every enqueue a dedup key so a retry never adds a job (D66–D73). The M5
+producers, workers and fenced store run against 3- or 5-replica clusters in the simulator, and
+three `spool serve --cluster` processes survive `kill -9` of their leader.
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
 ## Design in one paragraph
@@ -157,6 +161,27 @@ Its planted bugs (D64) are `vote-not-persisted`, `commit-old-term`, `no-log-trun
 builds (Figure 8 of the Raft paper; a crash between two candidates' vote requests), so scripted
 unit tests pin them, and DESIGN.md D64 gives the numbers.
 
+A replicated queue (M7) is three processes, each given every replica's address:
+
+```
+cargo run -- serve --data /tmp/n0 --id 0 --cluster 0=127.0.0.1:7001,1=127.0.0.1:7002,2=127.0.0.1:7003
+cargo run -- serve --data /tmp/n1 --id 1 --cluster 0=127.0.0.1:7001,1=127.0.0.1:7002,2=127.0.0.1:7003
+cargo run -- serve --data /tmp/n2 --id 2 --cluster 0=127.0.0.1:7001,1=127.0.0.1:7002,2=127.0.0.1:7003
+cargo run -- connect --cluster 0=127.0.0.1:7001,1=127.0.0.1:7002,2=127.0.0.1:7003
+```
+
+Kill the leader and the client finds the next one; restart it on its directory and it catches up
+from its Raft log. In the simulator, `--cluster` runs the M5 workload against such a cluster
+under every fault of M5 and M6:
+
+```
+cargo run --release -- sim --cluster --seeds 0..10000
+```
+
+Its planted bugs (D73) are `reply-before-commit` (the leader answers before the entry commits) and
+`ignore-term-on-reply` (the leader answers with whatever entry took its proposal's index); the
+queue's `no-fence` and `no-dedup-key` work there too.
+
 Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a
 scenario file (D20).
 
@@ -171,7 +196,7 @@ scenario file (D20).
 | M4 | Effectively-once: fencing tokens end to end, transactional ack, worker-crash tests |
 | M5 | Deterministic simulator: network, disk and clock from one seed, fault injection (done) |
 | M6 | Raft from scratch: election, replication, commit, tested in the simulator (done) |
-| M7 | The queue on Raft |
+| M7 | The queue on Raft: batches as entries, redirects, retries with dedup keys (done) |
 | M8 | Partitioning across Raft groups |
 | M9 | Jepsen-style history checker |
 | M10–M12 | Real processes under a fault proxy, benchmarks, write-up |

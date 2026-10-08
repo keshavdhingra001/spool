@@ -75,7 +75,7 @@ async fn handshake_and_protocol_errors() {
         assert!(read(&mut s).await.is_none(), "closed after the error");
     };
     refused(
-        frames(&[(1, Request::Hello { version: 2 })]),
+        frames(&[(1, Request::Hello { version: 3 })]),
         ErrorCode::UnsupportedVersion,
     )
     .await;

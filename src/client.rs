@@ -75,7 +75,8 @@ impl Client {
         protocol::encode_request(0, &Request::Hello { version }, &mut hello);
         protocol::write_all(&mut stream, &hello).await?;
         match read_reply(&mut stream).await? {
-            Reply::HelloOk { version: v } if v == version => {}
+            // A server may answer with an older version it shares with us.
+            Reply::HelloOk { version: v } if protocol::speaks(v) && v <= version => {}
             Reply::Error { message, .. } => return Err(ClientError::Server(message)),
             other => {
                 return Err(ClientError::Protocol(format!(

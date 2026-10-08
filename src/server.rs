@@ -392,17 +392,15 @@ async fn connection(
     };
     let greeted = match first {
         Some(Ok(Some(frame))) => match frame.request() {
-            Ok(Request::Hello { version }) if version == protocol::VERSION => pending
-                .send(Pending::Now(
-                    frame.id,
-                    Reply::HelloOk {
-                        version: protocol::VERSION,
-                    },
-                ))
+            Ok(Request::Hello { version }) if protocol::speaks(version) => pending
+                .send(Pending::Now(frame.id, Reply::HelloOk { version }))
                 .await
                 .is_ok(),
             Ok(Request::Hello { version }) => {
-                let message = format!("protocol version {version}, server speaks 1");
+                let message = format!(
+                    "protocol version {version}, server speaks 1 to {}",
+                    protocol::VERSION
+                );
                 let _ = pending
                     .send(error(frame.id, ErrorCode::UnsupportedVersion, message))
                     .await;

@@ -24,6 +24,7 @@ use crate::error::StoreError;
 use crate::fence::FencedStore;
 use crate::protocol::{self, Reply, Request};
 use crate::queue::{Queue, Snapshot};
+use crate::raft;
 use crate::reference::{Counts, ReferenceQueue};
 use crate::retry::QueueConfig;
 use crate::server::{Core, ServerError};
@@ -43,7 +44,6 @@ const SNAPSHOT_EVERY: u64 = 64;
 const MAX_BATCH: usize = 256;
 
 const SERVER: NodeId = NodeId(0);
-const STORE: NodeId = NodeId(1);
 
 /// A bug planted on purpose, to show the simulator finds it (D54).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +187,11 @@ pub struct Coverage {
     pub clock_back: u64,
     pub batches: u64,
     pub largest_batch: u64,
+    /// Answers from a replicated queue (M7): redirects to a named leader,
+    /// `not_leader` with no leader known, and `unknown` outcomes (D71).
+    pub redirects: u64,
+    pub not_leader: u64,
+    pub unknown: u64,
 }
 
 impl Coverage {
@@ -222,7 +227,10 @@ impl Coverage {
             pauses,
             clock_forward,
             clock_back,
-            batches
+            batches,
+            redirects,
+            not_leader,
+            unknown
         );
         self.largest_batch = self.largest_batch.max(o.largest_batch);
     }
@@ -271,6 +279,8 @@ pub enum Msg {
     },
     /// The store's answer: `ok` is false when the fence refused the write.
     Written { req: u64, ok: bool },
+    /// Between the replicas of a replicated queue (M7).
+    Raft(raft::Message),
 }
 
 impl Message for Msg {
@@ -291,6 +301,7 @@ impl Message for Msg {
             Msg::Written { req, ok } => {
                 super::digest(&[&req.to_le_bytes()[..], &[*ok as u8]].concat())
             }
+            Msg::Raft(m) => super::digest_of(m),
         }
     }
 }
@@ -308,6 +319,10 @@ impl fmt::Debug for Msg {
                         let events: Vec<String> = events.iter().map(Event::to_string).collect();
                         write!(f, "#{} -> {}", frame.id, events.join("; "))
                     }
+                    (_, Ok(Reply::NotLeader { leader })) => {
+                        write!(f, "#{} -> not leader, leader {leader:?}", frame.id)
+                    }
+                    (_, Ok(Reply::Unknown)) => write!(f, "#{} -> unknown", frame.id),
                     (req, reply) => write!(f, "#{} {req:?} {reply:?}", frame.id),
                 },
                 Err(e) => write!(f, "bad frame: {e}"),
@@ -319,40 +334,47 @@ impl fmt::Debug for Msg {
                 value,
             } => write!(f, "#{req} write job={job} token={token} value={value}"),
             Msg::Written { req, ok } => write!(f, "#{req} -> written ok={ok}"),
+            Msg::Raft(m) => write!(f, "{:?}", super::raft::Msg::Raft(m.clone())),
         }
     }
 }
 
 /// What the processes share with the run: the server's history, the store,
 /// the producers' answers and the first broken check.
-struct Shared {
-    bug: Option<Bug>,
+pub(super) struct Shared {
+    pub(super) bug: Option<Bug>,
+    /// The queue's servers: one, or the replicas of a cluster (M7), whose
+    /// Raft ids are their indexes here.
+    pub(super) servers: Vec<NodeId>,
+    pub(super) store: NodeId,
     next_req: u64,
     /// Every command the server tried to log, in log order: command `i` has
     /// LSN `i + 1`. Commands of a failed batch stay until recovery decides.
-    history: Vec<Command>,
+    pub(super) history: Vec<Command>,
     /// The last LSN in a batch the server answered: durable (D22).
-    replied: u64,
+    pub(super) replied: u64,
     /// The queue's counts after the last batch.
-    counts: Counts,
+    pub(super) counts: Counts,
     /// The job id each producer key got.
-    keys: BTreeMap<String, JobId>,
-    producers_done: BTreeSet<u32>,
-    fence: FencedStore<JobId, Payload>,
+    pub(super) keys: BTreeMap<String, JobId>,
+    pub(super) producers_done: BTreeSet<u32>,
+    pub(super) fence: FencedStore<JobId, Payload>,
     /// The store's contents: what the fence let through.
-    values: BTreeMap<JobId, (Token, Payload)>,
+    pub(super) values: BTreeMap<JobId, (Token, Payload)>,
     /// Every write the store accepted, in order.
-    accepted: Vec<(JobId, Token)>,
-    failure: Option<String>,
-    cov: Coverage,
+    pub(super) accepted: Vec<(JobId, Token)>,
+    pub(super) failure: Option<String>,
+    pub(super) cov: Coverage,
 }
 
-type Sh = Rc<RefCell<Shared>>;
+pub(super) type Sh = Rc<RefCell<Shared>>;
 
 impl Shared {
-    fn new(bug: Option<Bug>) -> Self {
+    pub(super) fn new(bug: Option<Bug>, servers: Vec<NodeId>, store: NodeId) -> Self {
         Shared {
             bug,
+            servers,
+            store,
             next_req: 0,
             history: Vec::new(),
             replied: 0,
@@ -367,17 +389,17 @@ impl Shared {
         }
     }
 
-    fn req(&mut self) -> u64 {
+    pub(super) fn req(&mut self) -> u64 {
         self.next_req += 1;
         self.next_req
     }
 
-    fn fail(&mut self, message: String) {
+    pub(super) fn fail(&mut self, message: String) {
         self.failure.get_or_insert(message);
     }
 }
 
-fn queue_name() -> QueueName {
+pub(super) fn queue_name() -> QueueName {
     QueueName::new("jobs").unwrap()
 }
 
@@ -387,15 +409,68 @@ fn frame(id: u64, op: Op) -> Msg {
     Msg::Frame(bytes)
 }
 
-/// The reply id and events in a frame from the server.
-fn events(msg: &Msg) -> Option<(u64, Vec<Event>)> {
+/// What a server answered a request.
+enum Answer {
+    Events(Vec<Event>),
+    /// From a replica that does not lead (D71): the leader's Raft id if known.
+    NotLeader(Option<u32>),
+    /// The outcome is unknown; resending is safe (D72).
+    Unknown,
+}
+
+/// The reply id and answer in a frame from a server.
+fn answer(msg: &Msg) -> Option<(u64, Answer)> {
     let Msg::Frame(bytes) = msg else {
         return None;
     };
     let frame = protocol::decode_frame(bytes).ok()?;
-    match frame.reply().ok()? {
-        Reply::Events(events) => Some((frame.id, events)),
-        _ => None,
+    let answer = match frame.reply().ok()? {
+        Reply::Events(events) => Answer::Events(events),
+        Reply::NotLeader { leader } => Answer::NotLeader(leader),
+        Reply::Unknown => Answer::Unknown,
+        _ => return None,
+    };
+    Some((frame.id, answer))
+}
+
+/// Which server a client sends to, and how it moves on (D71): to a named
+/// leader at once, otherwise to the next server.
+#[derive(Clone, Copy, Debug, Default)]
+struct Route {
+    target: u32,
+}
+
+impl Route {
+    fn server(&self, sh: &Shared) -> NodeId {
+        sh.servers[self.target as usize]
+    }
+
+    fn next(&mut self, sh: &Shared) {
+        self.target = (self.target + 1) % sh.servers.len() as u32;
+    }
+
+    /// Follow a non-event answer. True if the request should be resent now:
+    /// to a named leader, or after `unknown`. Without a known leader the
+    /// client moves on and waits for its timeout, so a cluster with no leader
+    /// is not flooded.
+    fn follow(&mut self, sh: &mut Shared, answer: &Answer) -> bool {
+        match *answer {
+            Answer::Events(_) => false,
+            Answer::NotLeader(Some(l)) if l != self.target => {
+                sh.cov.redirects += 1;
+                self.target = l;
+                true
+            }
+            Answer::NotLeader(_) => {
+                sh.cov.not_leader += 1;
+                self.next(sh);
+                false
+            }
+            Answer::Unknown => {
+                sh.cov.unknown += 1;
+                true
+            }
+        }
     }
 }
 
@@ -565,8 +640,8 @@ impl Process<Msg> for Server {
 // ---------------------------------------------------------------- store
 
 /// The external store (D43, D51): a fenced write per job, over the network.
-struct Store {
-    sh: Sh,
+pub(super) struct Store {
+    pub(super) sh: Sh,
 }
 
 impl Process<Msg> for Store {
@@ -605,10 +680,11 @@ impl Process<Msg> for Store {
 /// dedup key (D35), resending until it has the job id, with a pause of up to
 /// 3 s between jobs so the work spans the fault phase. After a crash it starts
 /// over from the first job: the keys make that safe.
-struct Producer {
+pub(super) struct Producer {
     sh: Sh,
     index: u32,
     jobs: u64,
+    route: Route,
     /// 0: configure; `1..=jobs`: enqueue job `next`.
     next: u64,
     /// The request waiting for its reply, 0 between jobs.
@@ -642,9 +718,22 @@ impl Producer {
                 key: (sh.bug != Some(Bug::NoDedupKey)).then(|| DedupKey::new(&key).unwrap()),
             }
         };
+        let to = self.route.server(&sh);
         drop(sh);
-        ctx.send(SERVER, frame(self.req, op));
+        ctx.send(to, frame(self.req, op));
         ctx.set_timer(TIMEOUT, self.req);
+    }
+
+    pub(super) fn new(sh: Sh, index: u32, jobs: u64) -> Self {
+        Producer {
+            sh,
+            index,
+            jobs,
+            route: Route::default(),
+            next: 0,
+            req: 0,
+            gap_timer: 0,
+        }
     }
 }
 
@@ -654,13 +743,20 @@ impl Process<Msg> for Producer {
     }
 
     fn receive(&mut self, ctx: &mut Ctx<'_, Msg>, _: NodeId, msg: Msg) {
-        let Some((id, events)) = events(&msg) else {
+        let Some((id, answer)) = answer(&msg) else {
             return;
         };
         if id != self.req || self.next > self.jobs {
             return;
         }
         let mut sh = self.sh.borrow_mut();
+        let Answer::Events(events) = answer else {
+            if self.route.follow(&mut sh, &answer) {
+                drop(sh);
+                self.send(ctx);
+            }
+            return;
+        };
         for e in &events {
             match e {
                 Event::Configured { .. } if self.next == 0 => self.next = 1,
@@ -691,7 +787,10 @@ impl Process<Msg> for Producer {
         if id == self.gap_timer {
             self.send(ctx);
         } else if id == self.req && self.req != 0 {
-            self.sh.borrow_mut().cov.enqueue_retries += 1;
+            let mut sh = self.sh.borrow_mut();
+            sh.cov.enqueue_retries += 1;
+            self.route.next(&sh);
+            drop(sh);
             self.send(ctx);
         }
     }
@@ -717,8 +816,9 @@ enum Doing {
 /// result, resending the complete with the same token on timeout (D42).
 /// Every timer gets a fresh id, and the worker remembers which ids it still
 /// expects, so timers and replies left over from an abandoned job do nothing.
-struct Worker {
+pub(super) struct Worker {
     sh: Sh,
+    route: Route,
     doing: Doing,
     /// The request the worker waits on: lease, write or complete.
     req: u64,
@@ -733,10 +833,49 @@ impl Worker {
         self.sh.borrow_mut().req()
     }
 
+    pub(super) fn new(sh: Sh) -> Self {
+        Worker {
+            sh,
+            route: Route::default(),
+            doing: Doing::Idle,
+            req: 0,
+            heartbeat: 0,
+            work_timer: 0,
+            poll_timer: 0,
+            heartbeat_timer: 0,
+        }
+    }
+
+    fn server(&self) -> NodeId {
+        self.route.server(&self.sh.borrow())
+    }
+
     fn request(&mut self, ctx: &mut Ctx<'_, Msg>, op: Op) {
         self.req = self.id();
-        ctx.send(SERVER, frame(self.req, op));
+        ctx.send(self.server(), frame(self.req, op));
         ctx.set_timer(TIMEOUT, self.req);
+    }
+
+    /// Resend the request in flight, after a timeout or an answer that is not
+    /// an outcome (D72): a lease asks again (and may orphan the first one), a
+    /// write or a complete goes again with the same token.
+    fn resend(&mut self, ctx: &mut Ctx<'_, Msg>) {
+        match self.doing {
+            Doing::Leasing => {
+                self.sh.borrow_mut().cov.lease_retries += 1;
+                self.poll(ctx);
+            }
+            Doing::Writing(lease) => {
+                self.sh.borrow_mut().cov.write_retries += 1;
+                self.write(ctx, lease);
+            }
+            Doing::Completing(lease, tries) => {
+                self.sh.borrow_mut().cov.complete_retries += 1;
+                self.doing = Doing::Completing(lease, tries + 1);
+                self.complete(ctx, lease);
+            }
+            Doing::Idle | Doing::Working(_) => {}
+        }
     }
 
     fn poll(&mut self, ctx: &mut Ctx<'_, Msg>) {
@@ -766,7 +905,8 @@ impl Worker {
             token: lease.token,
             value: effect(&lease),
         };
-        ctx.send(STORE, msg);
+        let store = self.sh.borrow().store;
+        ctx.send(store, msg);
         ctx.set_timer(TIMEOUT, self.req);
     }
 
@@ -857,7 +997,18 @@ impl Process<Msg> for Worker {
             }
             return;
         }
-        let Some((id, events)) = events(&msg) else {
+        let Some((id, answer)) = answer(&msg) else {
+            return;
+        };
+        let Answer::Events(events) = answer else {
+            let mine = id == self.req || (id == self.heartbeat && self.heartbeat != 0);
+            if mine {
+                let now = self.route.follow(&mut self.sh.borrow_mut(), &answer);
+                // A heartbeat is not resent: the next one goes to the new target.
+                if now && id == self.req {
+                    self.resend(ctx);
+                }
+            }
             return;
         };
         if id == self.req {
@@ -884,27 +1035,20 @@ impl Process<Msg> for Worker {
                 token: lease.token,
                 visibility: VISIBILITY,
             };
-            ctx.send(SERVER, frame(self.heartbeat, op));
+            ctx.send(self.server(), frame(self.heartbeat, op));
             self.heartbeat_timer = self.id();
             ctx.set_timer(Millis(VISIBILITY.0 / 3), self.heartbeat_timer);
         } else if id == self.req {
-            // The request timed out: resend it.
-            match self.doing {
-                Doing::Leasing => {
-                    self.sh.borrow_mut().cov.lease_retries += 1;
-                    self.poll(ctx);
-                }
-                Doing::Writing(lease) => {
-                    self.sh.borrow_mut().cov.write_retries += 1;
-                    self.write(ctx, lease);
-                }
-                Doing::Completing(lease, tries) => {
-                    self.sh.borrow_mut().cov.complete_retries += 1;
-                    self.doing = Doing::Completing(lease, tries + 1);
-                    self.complete(ctx, lease);
-                }
-                Doing::Idle | Doing::Working(_) => {}
+            // The request timed out: try the next server (the store is one
+            // node) and resend.
+            if !matches!(self.doing, Doing::Writing(_)) {
+                let sh = self.sh.borrow();
+                let mut route = self.route;
+                route.next(&sh);
+                drop(sh);
+                self.route = route;
             }
+            self.resend(ctx);
         }
     }
 }
@@ -914,7 +1058,11 @@ impl Process<Msg> for Worker {
 /// Run one seed: build the world, inject faults for `FAULT_PHASE`, heal, wait
 /// for every job to finish, then check the end state (D53).
 pub fn run(options: &Options) -> Result<Report, Failure> {
-    let sh: Sh = Rc::new(RefCell::new(Shared::new(options.bug)));
+    let sh: Sh = Rc::new(RefCell::new(Shared::new(
+        options.bug,
+        vec![SERVER],
+        NodeId(1),
+    )));
     let mut world = World::<Msg>::new(options.seed);
     if options.trace {
         world.enable_trace();
@@ -936,29 +1084,12 @@ pub fn run(options: &Options) -> Result<Report, Failure> {
     for index in 0..options.producers {
         let (s, jobs) = (sh.clone(), options.jobs);
         clients.push(world.add(Box::new(move |_, _| {
-            Box::new(Producer {
-                sh: s.clone(),
-                index,
-                jobs,
-                next: 0,
-                req: 0,
-                gap_timer: 0,
-            })
+            Box::new(Producer::new(s.clone(), index, jobs))
         })));
     }
     for _ in 0..options.workers {
         let s = sh.clone();
-        clients.push(world.add(Box::new(move |_, _| {
-            Box::new(Worker {
-                sh: s.clone(),
-                doing: Doing::Idle,
-                req: 0,
-                heartbeat: 0,
-                work_timer: 0,
-                poll_timer: 0,
-                heartbeat_timer: 0,
-            })
-        })));
+        clients.push(world.add(Box::new(move |_, _| Box::new(Worker::new(s.clone())))));
     }
     let nodes = 2 + clients.len() as u32;
 
@@ -1099,19 +1230,27 @@ fn inject(
 
 /// Every producer has its ids and the queue holds no job.
 fn done(sh: &Sh, options: &Options) -> bool {
-    let s = sh.borrow();
+    producers_done(&sh.borrow(), options.producers)
+}
+
+pub(super) fn producers_done(s: &Shared, producers: u32) -> bool {
     let c = s.counts;
-    s.producers_done.len() == options.producers as usize && c.waiting + c.leased + c.dead == 0
+    s.producers_done.len() == producers as usize && c.waiting + c.leased + c.dead == 0
 }
 
 /// The end-of-run checks of D53, on a queue recovered from the server's disk.
 fn check_end(world: &World<Msg>, sh: &Sh) -> Result<(), String> {
-    let s = sh.borrow();
     let files = world.disk(SERVER).files();
     let options = DurableOptions { snapshot_every: 0 };
     let (durable, _) = Durable::<MemStorage>::open(MemStorage::from_files(files), options)
         .map_err(|e| format!("final recovery failed: {e}"))?;
-    let q = durable.queue();
+    check_final(durable.queue(), &sh.borrow())
+}
+
+/// The end state of D53: an empty queue, one completed job per key, each
+/// job's result equal to the store's value by the completing token, and the
+/// store's tokens per job never going back.
+pub(super) fn check_final(q: &ReferenceQueue, s: &Shared) -> Result<(), String> {
     let c = q.counts();
     if c.waiting + c.leased + c.dead != 0 {
         return Err(format!("jobs left in the queue: {c:?}"));

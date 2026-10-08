@@ -10,6 +10,7 @@
 //! Faults are applied by whoever drives the world, between calls to
 //! [`World::run_until`].
 
+pub mod cluster;
 pub mod disk;
 pub mod queue;
 pub mod raft;

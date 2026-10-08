@@ -8,9 +8,13 @@
 //! hello_ok   (0x81) = version:u32                server -> client
 //! events     (0x82) = events (D33)               server -> client, one per request
 //! error      (0x83) = code:u8 len:u32 message    server -> client, then close
+//! not_leader (0x84) = has_leader:u8 leader:u32   server -> client (version 2, D71)
+//! unknown    (0x85)                              server -> client (version 2, D71)
 //! ```
 //!
-//! Replies come in request order and echo the request's id. A frame whose
+//! Replies come in request order and echo the request's id. Version 2 adds
+//! the two replies a replicated node sends (D71); servers accept versions 1
+//! and 2, and only a cluster ever sends them. A frame whose
 //! `len` is over [`MAX_FRAME`] is refused before anything is allocated for it.
 
 use std::io;
@@ -21,7 +25,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::codec::{self, DecodeError, Reader};
 use crate::command::{Event, Op};
 
-pub const VERSION: u32 = 1;
+/// The newest version; every version from 1 up to it is spoken.
+pub const VERSION: u32 = 2;
 /// Largest `len` accepted: 1 MiB (D32).
 pub const MAX_FRAME: u32 = 1 << 20;
 /// `kind` and `id`: the part of `len` that is not body.
@@ -32,6 +37,13 @@ const REQUEST: u8 = 2;
 const HELLO_OK: u8 = 0x81;
 const EVENTS: u8 = 0x82;
 const ERROR: u8 = 0x83;
+const NOT_LEADER: u8 = 0x84;
+const UNKNOWN: u8 = 0x85;
+
+/// Whether a server speaks protocol `version`.
+pub fn speaks(version: u32) -> bool {
+    (1..=VERSION).contains(&version)
+}
 
 /// What a client sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +64,12 @@ pub enum Reply {
         code: ErrorCode,
         message: String,
     },
+    /// This node does not lead; ask `leader` (a node id) if known (D71).
+    NotLeader {
+        leader: Option<u32>,
+    },
+    /// The request may or may not have applied; it is safe to resend (D72).
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +141,11 @@ pub fn encode_reply(id: u64, reply: &Reply, out: &mut Vec<u8>) {
             codec::put_u32(o, message.len() as u32);
             o.extend_from_slice(message.as_bytes());
         }),
+        Reply::NotLeader { leader } => put_frame(out, NOT_LEADER, id, |o| {
+            o.push(leader.is_some() as u8);
+            codec::put_u32(o, leader.unwrap_or(0));
+        }),
+        Reply::Unknown => put_frame(out, UNKNOWN, id, |_| {}),
     }
 }
 
@@ -159,6 +182,17 @@ impl Frame {
                 let message = String::from_utf8_lossy(r.bytes(len as usize)?).into_owned();
                 Reply::Error { code, message }
             }
+            NOT_LEADER => {
+                let has = r.u8()?;
+                let id = r.u32()?;
+                let leader = match has {
+                    0 => None,
+                    1 => Some(id),
+                    _ => return Err(DecodeError::Invalid(format!("leader flag {has}")).into()),
+                };
+                Reply::NotLeader { leader }
+            }
+            UNKNOWN => Reply::Unknown,
             kind => return Err(FrameError::UnknownKind(kind)),
         };
         r.finish()?;
@@ -271,6 +305,9 @@ mod tests {
                 code: ErrorCode::Protocol,
                 message: String::new(),
             },
+            Reply::NotLeader { leader: None },
+            Reply::NotLeader { leader: Some(4) },
+            Reply::Unknown,
         ];
         for (id, reply) in replies.into_iter().enumerate() {
             let mut out = Vec::new();

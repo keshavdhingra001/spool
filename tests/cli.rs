@@ -151,3 +151,32 @@ fn sim_raft_replays_a_seed_and_reports_a_planted_bug() {
         Some(2)
     );
 }
+
+#[test]
+fn sim_cluster_replays_a_seed_and_reports_a_planted_bug() {
+    let sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_spool"))
+            .args(["sim", "--cluster"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let traced = sim(&["--seed", "2", "--trace"]);
+    assert!(traced.status.success());
+    let text = String::from_utf8(traced.stdout).unwrap();
+    assert!(
+        text.contains("append t") && text.contains("lease jobs") && text.contains("trace hash"),
+        "{text}"
+    );
+    let swept = sim(&["--seeds", "0..5", "--bug", "no-fence"]);
+    assert_eq!(swept.status.code(), Some(1));
+    let text = String::from_utf8(swept.stdout).unwrap();
+    assert!(
+        text.contains("failed") && text.contains("replay: cargo run -- sim --cluster --seed"),
+        "{text}"
+    );
+    assert_eq!(
+        sim(&["--seed", "1", "--bug", "nonsense"]).status.code(),
+        Some(2)
+    );
+}

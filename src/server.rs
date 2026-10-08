@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::check::agree;
 use crate::command::{Command, Event, Op};
-use crate::durable::{Durable, Options};
+use crate::durable::{Durable, Options, Recovery};
 use crate::error::StoreError;
 use crate::ledger::Ledger;
 use crate::protocol::{self, ErrorCode, FrameError, Reply, Request};
@@ -163,7 +163,7 @@ impl<S: Storage + Send + 'static> Server<S> {
         listen: SocketAddr,
         options: ServerOptions,
     ) -> Result<Self, ServerError> {
-        let (durable, _) = Durable::open(storage, options.durable)?;
+        let (core_state, _) = Core::open(storage, options.durable, options.check)?;
         let listener = TcpListener::bind(listen).await?;
         let addr = listener.local_addr()?;
         let (core_tx, core_rx) = mpsc::channel(options.core_queue);
@@ -172,7 +172,7 @@ impl<S: Storage + Send + 'static> Server<S> {
         std::thread::Builder::new()
             .name("spool-core".into())
             .spawn(move || {
-                let _ = done_tx.send(core(durable, core_rx, &core_options));
+                let _ = done_tx.send(core(core_state, core_rx, &core_options));
             })?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let accept = tokio::spawn(accept(listener, core_tx, options.in_flight, shutdown_rx));
@@ -205,19 +205,75 @@ impl<S: Storage + Send + 'static> Server<S> {
     }
 }
 
+/// The server's batch logic (D30): apply a batch of ops at one time with one
+/// sync, then (with `check`) run both checkers (D39). The core thread and the
+/// simulated server (D47) both drive it.
+pub struct Core<S: Storage> {
+    durable: Durable<S>,
+    /// Present when checking: resumed from the recovered state, not from nothing.
+    ledger: Option<Ledger>,
+    stats: Stats,
+    cmds: Vec<Command>,
+}
+
+impl<S: Storage> Core<S> {
+    /// Recover the queue from `storage` (D29).
+    pub fn open(storage: S, options: Options, check: bool) -> Result<(Self, Recovery), StoreError> {
+        let (durable, recovery) = Durable::open(storage, options)?;
+        let ledger = check.then(|| Ledger::resume(durable.queue()));
+        let core = Core {
+            durable,
+            ledger,
+            stats: Stats::default(),
+            cmds: Vec::new(),
+        };
+        Ok((core, recovery))
+    }
+
+    /// Apply `ops` as one batch, every command at time `at` (D31), and return
+    /// each one's events once all of them are durable.
+    pub fn apply(
+        &mut self,
+        at: Time,
+        ops: impl IntoIterator<Item = Op>,
+    ) -> Result<Vec<Vec<Event>>, ServerError> {
+        self.cmds.clear();
+        self.cmds
+            .extend(ops.into_iter().map(|op| Command { at, op }));
+        let events = self.durable.apply_batch(&self.cmds)?;
+        let n = self.cmds.len();
+        self.stats.batches += 1;
+        self.stats.commands += n as u64;
+        self.stats.largest_batch = self.stats.largest_batch.max(n);
+        if let Some(ledger) = &mut self.ledger {
+            check(&self.durable, ledger, &events).map_err(ServerError::Invariant)?;
+            self.stats.checked += 1;
+        }
+        Ok(events)
+    }
+
+    pub fn durable(&self) -> &Durable<S> {
+        &self.durable
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    pub fn into_storage(self) -> S {
+        self.durable.into_storage()
+    }
+}
+
 /// The core thread (D30): apply batches until every sender is gone or the
 /// queue fails. Dropping the receiver and the pending reply senders on the way
 /// out is what tells the connections to close.
 fn core<S: Storage>(
-    mut durable: Durable<S>,
+    mut core: Core<S>,
     mut rx: mpsc::Receiver<Job>,
     options: &ServerOptions,
 ) -> Stopped<S> {
-    let mut stats = Stats::default();
-    // The ledger starts from the recovered state, not from nothing.
-    let mut ledger = Ledger::resume(durable.queue());
     let mut batch = Vec::with_capacity(options.max_batch);
-    let mut cmds = Vec::with_capacity(options.max_batch);
     let result = loop {
         let Some(first) = rx.blocking_recv() else {
             break Ok(());
@@ -231,32 +287,19 @@ fn core<S: Storage>(
         }
         // One clock read per batch (D31): every command in it runs at one time.
         let at = (options.clock)();
-        cmds.extend(batch.iter().map(|j: &Job| Command {
-            at,
-            op: j.op.clone(),
-        }));
-        let events = match durable.apply_batch(&cmds) {
+        let events = match core.apply(at, batch.iter().map(|j: &Job| j.op.clone())) {
             Ok(events) => events,
-            Err(e) => break Err(e.into()),
+            Err(e) => break Err(e),
         };
-        cmds.clear();
-        stats.batches += 1;
-        stats.commands += batch.len() as u64;
-        stats.largest_batch = stats.largest_batch.max(batch.len());
-        if options.check
-            && let Err(e) = check(&durable, &mut ledger, &events)
-        {
-            break Err(ServerError::Invariant(e));
-        }
-        stats.checked += u64::from(options.check);
         for (job, events) in batch.drain(..).zip(events) {
             // The client may have gone; its reply has nowhere to go.
             let _ = job.reply.send(events);
         }
     };
     drop(rx);
+    let stats = core.stats();
     Stopped {
-        storage: durable.into_storage(),
+        storage: core.into_storage(),
         stats,
         result,
     }

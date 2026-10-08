@@ -189,6 +189,30 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>
     }))
 }
 
+/// Decode exactly one frame from `bytes`, length prefix included: how the
+/// simulator's datagrams carry frames (D49).
+pub fn decode_frame(bytes: &[u8]) -> Result<Frame, FrameError> {
+    let (len, rest) = bytes
+        .split_first_chunk::<4>()
+        .ok_or(DecodeError::Truncated)?;
+    let len = u32::from_le_bytes(*len);
+    if !(FRAME_HEAD..=MAX_FRAME).contains(&len) {
+        return Err(FrameError::BadLength(len));
+    }
+    let len = len as usize;
+    if rest.len() < len {
+        return Err(DecodeError::Truncated.into());
+    }
+    if rest.len() > len {
+        return Err(DecodeError::TrailingBytes(rest.len() - len).into());
+    }
+    Ok(Frame {
+        kind: rest[0],
+        id: u64::from_le_bytes(rest[1..9].try_into().unwrap()),
+        body: rest[9..].to_vec(),
+    })
+}
+
 /// Write already-encoded frames and flush.
 pub async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.write_all(bytes).await?;
@@ -269,6 +293,36 @@ mod tests {
             frame.reply(),
             Err(FrameError::UnknownKind(REQUEST))
         ));
+    }
+
+    #[test]
+    fn decode_frame_takes_exactly_one_whole_frame() {
+        let mut hello = Vec::new();
+        encode_request(3, &Request::Hello { version: 1 }, &mut hello);
+        assert_eq!(
+            decode_frame(&hello).unwrap(),
+            read_one(&hello).unwrap().unwrap()
+        );
+        for len in 0..hello.len() {
+            assert!(
+                matches!(
+                    decode_frame(&hello[..len]),
+                    Err(FrameError::Body(DecodeError::Truncated))
+                ),
+                "cut at {len}"
+            );
+        }
+        let mut two = hello.clone();
+        two.extend_from_slice(&hello);
+        assert!(matches!(
+            decode_frame(&two),
+            Err(FrameError::Body(DecodeError::TrailingBytes(17)))
+        ));
+        for len in [0, 8, MAX_FRAME + 1] {
+            let mut bytes = len.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&[0; 16]);
+            assert!(matches!(decode_frame(&bytes), Err(FrameError::BadLength(l)) if l == len));
+        }
     }
 
     #[test]

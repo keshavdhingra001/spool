@@ -767,6 +767,43 @@ fn only_progress_starts_another_append() {
 }
 
 #[test]
+fn a_late_rejection_never_moves_next_index_forward() {
+    let mut c = Cluster::new(3);
+    c.elect(0);
+    c.inflight.clear();
+    for i in 0..10 {
+        c.propose(0, &format!("e{i}")).unwrap();
+    }
+    c.inflight.clear();
+    let reject = |prev_index, first_index| Message::AppendReply {
+        term: 1,
+        result: AppendResult::Reject {
+            prev_index,
+            conflict_term: None,
+            first_index,
+        },
+    };
+    // Node 1 holds only entry 1: the current rejection sends next back to 2.
+    c.nodes[0].receive(1, reject(11, 2));
+    c.drain(0);
+    // An older rejection, for an append at prev_index 8, arrives late.
+    c.nodes[0].receive(1, reject(8, 9));
+    c.drain(0);
+    c.inflight.clear();
+    c.heartbeat(0);
+    let prev: Vec<u64> = c
+        .inflight
+        .iter()
+        .filter(|(_, to, _)| *to == 1)
+        .map(|(_, _, m)| match m {
+            Message::Append { prev_index, .. } => *prev_index,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(prev, [1], "still sending from entry 2");
+}
+
+#[test]
 fn a_single_node_cluster_elects_itself_and_commits_alone() {
     let mut c = Cluster::new(1);
     c.timeout(0);

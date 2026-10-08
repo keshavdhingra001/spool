@@ -2,10 +2,10 @@
 
 A distributed task queue in Rust, built from the bottom up: its own broker and storage (no Redis or
 Postgres underneath), leases with visibility timeouts and fencing tokens, effectively-once
-processing, partition testing by deterministic simulation, and (in progress) Raft replication
-written from scratch.
+processing, partition testing by deterministic simulation, and Raft replication written from
+scratch (the queue moves onto it in M7).
 
-**Status:** M5. Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
+**Status:** M6. Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
 ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state with redrive
 (M1). Durable (M2): every command goes into a checksummed write-ahead log and is synced before
 its result is returned, with periodic snapshots and recovery that is tested by failing at every
@@ -21,7 +21,11 @@ replies and wakes zombies, and checks that every job's effect is the one its com
 (D46). Simulated (M5): a deterministic simulator runs the server, its log on a simulated disk, a
 fenced store, producers and workers in one thread from one seed, through lost, duplicated and late
 messages, partitions, crashes, torn writes, pauses and clock jumps, and checks durability,
-deduplication and effectively-once effects at every batch and every recovery (D47–D55). Raft (M6)
+deduplication and effectively-once effects at every batch and every recovery (D47–D55). Raft (M6):
+a pure Raft node with PreVote, CheckQuorum, conflict hints and the current-term commit rule, its
+log in the same checksummed format, run in the simulator as clusters of 3 or 5 under the same
+faults plus one-way cuts and crashes right after a sync, and checked live for election safety,
+log matching, leader completeness and state machine safety (D56–D65). The queue on Raft (M7)
 comes next.
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
@@ -134,6 +138,25 @@ Two bugs can be planted on purpose to show the checks find them (D54): `--bug no
 accepts a zombie's late write) and `--bug no-dedup-key` (a producer's retry adds a second job). Both
 fail within the first few seeds, with the seed and the replay command in the message.
 
+`--raft` runs a Raft cluster instead (M6): 3 or 5 nodes, three clients proposing 20 operations each,
+the same faults plus one-way cuts and crashes right after a sync:
+
+```
+cargo run --release -- sim --raft --seeds 0..10000
+cargo run --release -- sim --raft --seed 4 --trace
+     234 recv n1->n0 prevote t1 last=0/t0                 n1's timer fired: could it win term 1?
+     239 recv n0->n1 prevote-reply t1 granted=true
+     243 recv n1->n2 vote t1 last=0/t0                    a majority said yes: now it raises its term
+     250 recv n2->n1 vote-reply t1 granted=true
+     256 recv n1->n0 append t1 prev=0/t0 commit=0 [t1:no-op]   leader of term 1: its no-op first (D61)
+     258 recv n0->n1 append-ok t1 matched=1
+```
+
+Its planted bugs (D64) are `vote-not-persisted`, `commit-old-term`, `no-log-truncate` and
+`stale-term-accept`. The last two fail at seed 0. The first two need schedules a random swarm rarely
+builds (Figure 8 of the Raft paper; a crash between two candidates' vote requests), so scripted
+unit tests pin them, and DESIGN.md D64 gives the numbers.
+
 Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a
 scenario file (D20).
 
@@ -147,7 +170,8 @@ scenario file (D20).
 | M3 | TCP server, binary protocol, worker library, idempotent enqueue |
 | M4 | Effectively-once: fencing tokens end to end, transactional ack, worker-crash tests |
 | M5 | Deterministic simulator: network, disk and clock from one seed, fault injection (done) |
-| M6–M7 | Raft from scratch; the queue on Raft |
+| M6 | Raft from scratch: election, replication, commit, tested in the simulator (done) |
+| M7 | The queue on Raft |
 | M8 | Partitioning across Raft groups |
 | M9 | Jepsen-style history checker |
 | M10–M12 | Real processes under a fault proxy, benchmarks, write-up |

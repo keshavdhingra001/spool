@@ -5,7 +5,9 @@
 //! issued, so it is sometimes current, sometimes stale, expired or already acked.
 //! Times mostly move forward in small steps, sometimes jump back (D9), and
 //! rarely jump past the dedup window (D35), so keys are both repeated inside
-//! their window and reused after it.
+//! their window and reused after it. Some enqueues carry ordering keys (D79),
+//! and queue `a` sometimes gains consumer groups (D80), one of which (`a:g`)
+//! is leased from like any queue.
 
 use std::collections::BTreeSet;
 
@@ -13,8 +15,8 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use spool::{
-    Checked, Command, DedupKey, Event, JobId, Millis, Op, Payload, Queue, QueueConfig, QueueName,
-    ReferenceQueue, ResultStatus, Time, Token,
+    Checked, Command, DedupKey, Event, JobId, Millis, Op, OrderKey, Payload, Queue, QueueConfig,
+    QueueName, ReferenceQueue, ResultStatus, Time, Token,
 };
 
 #[derive(Clone, Debug)]
@@ -23,6 +25,7 @@ enum Action {
         queue: usize,
         delay: u64,
         key: Option<usize>,
+        order: Option<usize>,
     },
     Lease {
         queue: usize,
@@ -53,6 +56,9 @@ enum Action {
     Redrive {
         queue: usize,
     },
+    Subscribe {
+        group: usize,
+    },
     Tick,
 }
 
@@ -63,8 +69,10 @@ struct Step {
     action: Action,
 }
 
-const QUEUES: [&str; 2] = ["a", "b"];
+const QUEUES: [&str; 3] = ["a", "b", "a:g"];
 const KEYS: [&str; 3] = ["k0", "k1", "k2"];
+const ORDERS: [&str; 2] = ["o0", "o1"];
+const GROUPS: [&str; 2] = ["g", "h"];
 
 fn action() -> impl Strategy<Value = Action> {
     let queue = 0..QUEUES.len();
@@ -73,8 +81,9 @@ fn action() -> impl Strategy<Value = Action> {
             queue.clone(),
             prop_oneof![3 => Just(0u64), 1 => 1..40u64],
             prop_oneof![1 => Just(None), 1 => (0..KEYS.len()).prop_map(Some)],
+            prop_oneof![1 => Just(None), 1 => (0..ORDERS.len()).prop_map(Some)],
         )
-            .prop_map(|(queue, delay, key)| Action::Enqueue { queue, delay, key }),
+            .prop_map(|(queue, delay, key, order)| Action::Enqueue { queue, delay, key, order }),
         5 => (queue.clone(), 0..40u64).prop_map(|(queue, visibility)| Action::Lease { queue, visibility }),
         2 => (any::<usize>(), 0..40u64).prop_map(|(pick, visibility)| Action::Heartbeat { pick, visibility }),
         3 => any::<usize>().prop_map(|pick| Action::Ack { pick }),
@@ -84,6 +93,7 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (queue.clone(), 0..4u32, 0..30u64, 0..40u64)
             .prop_map(|(queue, max, base, cap)| Action::Configure { queue, max, base, cap }),
         1 => queue.prop_map(|queue| Action::Redrive { queue }),
+        1 => (0..GROUPS.len()).prop_map(|group| Action::Subscribe { group }),
         1 => Just(Action::Tick),
     ]
 }
@@ -124,11 +134,13 @@ impl Resolver {
                 queue: q,
                 delay,
                 key,
+                order,
             } => Op::Enqueue {
                 queue: queue(q),
                 payload: Payload(format!("p{}", self.at).into_bytes()),
                 delay: Millis(delay),
                 key: key.map(|k| DedupKey::new(KEYS[k]).unwrap()),
+                order: order.map(|k| OrderKey::new(ORDERS[k]).unwrap()),
             },
             Action::Lease {
                 queue: q,
@@ -179,6 +191,10 @@ impl Resolver {
                 },
             },
             Action::Redrive { queue: q } => Op::Redrive { queue: queue(q) },
+            Action::Subscribe { group } => Op::Subscribe {
+                queue: queue(0),
+                group: QueueName::new(GROUPS[group]).unwrap(),
+            },
             Action::Tick => Op::Tick,
         };
         Command {
@@ -297,6 +313,37 @@ fn generator_covers_every_outcome() {
                 seen.insert("completed again".to_string());
             }
         }
+        // Only a fan-out fills `a:h` (D80), and a second job of an ordering
+        // key leased means the key's first job went before it (D79).
+        let mut orders = BTreeSet::new();
+        let mut keyed = std::collections::BTreeMap::new();
+        for e in &events {
+            match e {
+                Event::Enqueued { queue, .. } if queue.as_str() == "a:h" => {
+                    seen.insert("fan-out".to_string());
+                }
+                _ => {}
+            }
+            if let Event::Enqueued {
+                job,
+                queue,
+                order: Some(order),
+                ..
+            } = e
+            {
+                let k = (queue.clone(), order.clone());
+                let second = keyed.values().any(|x| *x == k);
+                keyed.insert(*job, k);
+                if second {
+                    orders.insert(*job);
+                }
+            }
+            if let Event::Leased { lease, .. } = e
+                && orders.contains(&lease.job)
+            {
+                seen.insert("later job of an ordering key leased".to_string());
+            }
+        }
         // A key enqueued a second time created a job: its window had ended.
         let mut keys = BTreeSet::new();
         for e in &events {
@@ -320,10 +367,13 @@ fn generator_covers_every_outcome() {
         "deduplicated",
         "empty",
         "enqueued",
+        "fan-out",
         "key reused after its window",
+        "later job of an ordering key leased",
         "leased",
         "redriven",
         "rejected bad_config",
+        "rejected bad_group",
         "rejected not_leased",
         "rejected stale_token",
         "rejected unknown_job",
@@ -335,6 +385,7 @@ fn generator_covers_every_outcome() {
         "result pending",
         "result unknown",
         "retrying",
+        "subscribed",
     ];
     let missing: Vec<_> = expected.iter().filter(|k| !seen.contains(**k)).collect();
     assert!(

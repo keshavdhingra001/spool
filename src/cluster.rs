@@ -402,6 +402,7 @@ mod tests {
             payload: Payload(vec![7; size]),
             delay: Millis(0),
             key: None,
+            order: None,
         };
         Input::Request(Job { op, reply })
     }

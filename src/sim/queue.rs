@@ -737,6 +737,7 @@ impl Producer {
                 payload: Payload(key.clone().into_bytes()),
                 delay: Millis(0),
                 key: (sh.bug != Some(Bug::NoDedupKey)).then(|| DedupKey::new(&key).unwrap()),
+                order: None,
             }
         };
         let to = self.route.server(&sh);

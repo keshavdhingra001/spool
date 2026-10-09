@@ -64,8 +64,9 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:7878";
 
 const HELP: &str = "\
 commands (every queue command starts with its logical time in ms):
-  @<ms> enqueue   <queue> <payload> [delay=<ms>] [key=<key>]
-                  payload: visible ASCII, %XX escapes, - for empty; key: dedup key (5 min)
+  @<ms> enqueue   <queue> <payload> [delay=<ms>] [key=<key>] [order=<key>]
+                  payload: visible ASCII, %XX escapes, - for empty; key: dedup key (5 min);
+                  order: jobs with the same ordering key are leased one at a time, in order
   @<ms> lease     <queue> <visibility_ms>
   @<ms> heartbeat <job> <token> <visibility_ms>
   @<ms> ack       <job> <token>
@@ -74,6 +75,7 @@ commands (every queue command starts with its logical time in ms):
   @<ms> result    <job>
   @<ms> configure <queue> <max_attempts> <backoff_base_ms> <backoff_cap_ms>
   @<ms> redrive   <queue>
+  @<ms> subscribe <queue> <group>             each enqueue adds a job to <queue>:<group>
   @<ms> tick
   jobs              list live jobs
   run <file>        run a scenario file on a fresh in-memory queue

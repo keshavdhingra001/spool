@@ -1,0 +1,42 @@
+# Consumer groups (D80): once a queue has groups, an enqueue adds one job to
+# each group's queue `<queue>:<group>`, in one command, and none to the queue.
+@0 subscribe emails audit
+= subscribed queue=emails group=audit
+@0 subscribe emails send
+= subscribed queue=emails group=send
+# Subscribing again changes nothing.
+@0 subscribe emails send
+= subscribed queue=emails group=send
+# The dedup key names the first group's job; the ordering key goes to each.
+@0 enqueue emails m1 key=k order=u1
+= enqueued job=1 queue=emails:audit ready_at=0 key=k order=u1
+= enqueued job=2 queue=emails:send ready_at=0 key=k order=u1
+@1 enqueue emails m1 key=k
+= deduplicated job=1 queue=emails key=k
+@1 lease emails 100
+= empty queue=emails
+@1 lease emails:send 100
+= leased job=2 token=1 deadline=101 attempt=1 payload=m1
+@1 lease emails:audit 100
+= leased job=1 token=2 deadline=101 attempt=1 payload=m1
+# Each group's queue has its own retry policy: audit gives up after 1 attempt.
+@2 configure emails:audit 1 0 0
+= configured queue=emails:audit max_attempts=1 backoff_base=0 backoff_cap=0
+@2 nack 1 2
+= released job=1 token=2 reason=nack
+= dead job=1
+# A group added later gets only the jobs enqueued after it.
+@3 subscribe emails late
+= subscribed queue=emails group=late
+@3 enqueue emails m2
+= enqueued job=3 queue=emails:audit ready_at=3
+= enqueued job=4 queue=emails:late ready_at=3
+= enqueued job=5 queue=emails:send ready_at=3
+# A group's queue cannot have groups, and a group cannot be a group's queue.
+@4 subscribe emails:send x
+= rejected reason=bad_group
+@4 subscribe emails x:y
+= rejected reason=bad_group
+# Only an enqueue to the queue fills a group's queue.
+@4 enqueue emails:send direct
+= rejected reason=bad_group

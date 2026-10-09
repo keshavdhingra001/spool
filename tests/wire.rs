@@ -5,12 +5,20 @@ use proptest::prelude::*;
 use spool::codec::{decode_events, encode_events};
 use spool::protocol::{Request, encode_request, read_frame};
 use spool::{
-    DedupKey, Event, JobId, Lease, Millis, Op, Payload, QueueConfig, QueueName, RejectReason,
-    ReleaseReason, ResultStatus, Time, Token,
+    DedupKey, Event, JobId, Lease, Millis, Op, OrderKey, Payload, QueueConfig, QueueName,
+    RejectReason, ReleaseReason, ResultStatus, Time, Token,
 };
 
 fn queue() -> impl Strategy<Value = QueueName> {
-    "[A-Za-z0-9_.-]{1,64}".prop_map(|s| QueueName::new(&s).unwrap())
+    prop_oneof![
+        "[A-Za-z0-9_.-]{1,64}",
+        "[A-Za-z0-9_.-]{1,31}:[A-Za-z0-9_.-]{1,32}",
+    ]
+    .prop_map(|s| QueueName::new(&s).unwrap())
+}
+
+fn order() -> impl Strategy<Value = OrderKey> {
+    "[!-~]{1,128}".prop_map(|s| OrderKey::new(&s).unwrap())
 }
 
 fn key() -> impl Strategy<Value = DedupKey> {
@@ -26,14 +34,21 @@ fn event() -> impl Strategy<Value = Event> {
         deadline: Time(d),
     });
     prop_oneof![
-        (job.clone(), queue(), time.clone(), prop::option::of(key())).prop_map(
-            |(job, queue, ready_at, key)| Event::Enqueued {
+        (
+            job.clone(),
+            queue(),
+            time.clone(),
+            prop::option::of(key()),
+            prop::option::of(order())
+        )
+            .prop_map(|(job, queue, ready_at, key, order)| Event::Enqueued {
                 job,
                 queue,
                 ready_at,
-                key
-            }
-        ),
+                key,
+                order
+            }),
+        (queue(), queue()).prop_map(|(queue, group)| Event::Subscribed { queue, group }),
         (
             lease.clone(),
             any::<u32>(),
@@ -75,6 +90,7 @@ fn event() -> impl Strategy<Value = Event> {
             RejectReason::StaleToken,
             RejectReason::ZeroVisibility,
             RejectReason::BadConfig,
+            RejectReason::BadGroup,
         ])
         .prop_map(|reason| Event::Rejected { reason }),
         (job.clone(), any::<u64>()).prop_map(|(job, t)| Event::Completed {
@@ -116,6 +132,7 @@ proptest! {
             payload: Payload(payload),
             delay: Millis(3),
             key,
+            order: None,
         });
         let mut bytes = Vec::new();
         encode_request(id, &req, &mut bytes);

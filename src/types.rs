@@ -22,12 +22,36 @@ impl Time {
     }
 }
 
-/// Broker-assigned job id, unique for the life of the queue (D10).
+/// Broker-assigned job id, unique for the life of the queue (D10). The top
+/// 16 bits name the partition that issued it (D77); a single node is
+/// partition 0, so its ids are 1, 2, 3, ...
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobId(pub u64);
 
+impl JobId {
+    /// Bits below the partition: each partition's own count.
+    pub const PARTITION_SHIFT: u32 = 48;
+
+    /// The `n`th id of `partition` (n from 1).
+    pub fn new(partition: u16, n: u64) -> JobId {
+        debug_assert!(n < 1 << Self::PARTITION_SHIFT);
+        JobId(u64::from(partition) << Self::PARTITION_SHIFT | n)
+    }
+
+    /// The partition that issued this id (D77).
+    pub fn partition(self) -> u16 {
+        (self.0 >> Self::PARTITION_SHIFT) as u16
+    }
+
+    /// This id's place in its partition's count.
+    pub fn n(self) -> u64 {
+        self.0 & ((1 << Self::PARTITION_SHIFT) - 1)
+    }
+}
+
 /// Fencing token (D5, D10). Every lease gets a token larger than every token
-/// issued before it, across all jobs, so "newer lease" is a plain comparison.
+/// issued before it in its partition, across all jobs (D77), so "newer lease"
+/// is a plain comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Token(pub u64);
 
@@ -40,7 +64,9 @@ pub struct Lease {
     pub deadline: Time,
 }
 
-/// Name of a queue: 1 to [`QueueName::MAX_LEN`] characters from `[A-Za-z0-9_.-]`.
+/// Name of a queue: 1 to [`QueueName::MAX_LEN`] characters from `[A-Za-z0-9_.-]`,
+/// or a consumer group's queue `<queue>:<group>` (D80), two such names joined
+/// by one `:` and together no longer than the limit.
 ///
 /// Restricted so a name is always one whitespace-free token in the text format
 /// (D12) and can later be used in file names and metrics labels without escaping.
@@ -52,10 +78,29 @@ impl QueueName {
 
     pub fn new(name: &str) -> Result<QueueName, ParseError> {
         let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
-        if name.is_empty() || name.len() > Self::MAX_LEN || !name.chars().all(valid_char) {
+        let valid_part = |p: &str| !p.is_empty() && p.chars().all(valid_char);
+        let valid = match name.split_once(':') {
+            None => valid_part(name),
+            Some((queue, group)) => valid_part(queue) && valid_part(group),
+        };
+        if !valid || name.len() > Self::MAX_LEN {
             return Err(ParseError::BadQueueName(name.to_string()));
         }
         Ok(QueueName(name.to_string()))
+    }
+
+    /// The queue of consumer group `group` of this queue (D80). Neither name
+    /// may be a group's queue itself, and the result must fit the limit.
+    pub fn group(&self, group: &QueueName) -> Option<QueueName> {
+        if self.is_group() || group.is_group() {
+            return None;
+        }
+        QueueName::new(&format!("{}:{}", self.0, group.0)).ok()
+    }
+
+    /// Whether this is a consumer group's queue, `<queue>:<group>` (D80).
+    pub fn is_group(&self) -> bool {
+        self.0.contains(':')
     }
 
     pub fn as_str(&self) -> &str {
@@ -77,6 +122,27 @@ impl DedupKey {
             return Err(ParseError::BadKey(key.to_string()));
         }
         Ok(DedupKey(key.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Ordering key of an enqueue (D79): jobs of one queue with the same key are
+/// leased one at a time, in enqueue order. Same rules as a [`DedupKey`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OrderKey(String);
+
+impl OrderKey {
+    pub const MAX_LEN: usize = 128;
+
+    pub fn new(key: &str) -> Result<OrderKey, ParseError> {
+        if key.is_empty() || key.len() > Self::MAX_LEN || !key.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(ParseError::BadOrderKey(key.to_string()));
+        }
+        Ok(OrderKey(key.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -185,6 +251,12 @@ impl fmt::Display for DedupKey {
     }
 }
 
+impl fmt::Display for OrderKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl fmt::Display for QueueName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -207,6 +279,7 @@ mod tests {
             "a",
             "emails",
             "img.resize-v2_hi",
+            "emails:audit",
             &"x".repeat(QueueName::MAX_LEN),
         ] {
             assert_eq!(QueueName::new(ok).unwrap().as_str(), ok);
@@ -216,11 +289,45 @@ mod tests {
             "has space",
             "slash/es",
             "é",
+            ":g",
+            "q:",
+            "a:b:c",
             &"x".repeat(QueueName::MAX_LEN + 1),
         ] {
             assert_eq!(
                 QueueName::new(bad),
                 Err(ParseError::BadQueueName(bad.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn group_queues() {
+        let q = |s| QueueName::new(s).unwrap();
+        assert_eq!(q("emails").group(&q("audit")), Some(q("emails:audit")));
+        assert!(q("emails:audit").is_group());
+        assert!(!q("emails").is_group());
+        assert_eq!(q("emails:audit").group(&q("x")), None);
+        assert_eq!(q("emails").group(&q("a:b")), None);
+        let long = "x".repeat(QueueName::MAX_LEN / 2);
+        assert_eq!(q(&long).group(&q(&long)), None, "one over the limit");
+    }
+
+    #[test]
+    fn job_ids_carry_their_partition() {
+        assert_eq!(JobId::new(0, 7), JobId(7));
+        let id = JobId::new(3, 9);
+        assert_eq!((id.partition(), id.n()), (3, 9));
+        assert_eq!(JobId::new(u16::MAX, 1).partition(), u16::MAX);
+    }
+
+    #[test]
+    fn order_key_rules() {
+        assert_eq!(OrderKey::new("user-7").unwrap().as_str(), "user-7");
+        for bad in ["", "a b", &"x".repeat(OrderKey::MAX_LEN + 1)] {
+            assert_eq!(
+                OrderKey::new(bad),
+                Err(ParseError::BadOrderKey(bad.to_string()))
             );
         }
     }

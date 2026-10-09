@@ -1,0 +1,57 @@
+# Ordering keys (D79): jobs of one queue with the same ordering key are leased
+# one at a time, in enqueue order. Other keys, and jobs without one, are not
+# held back.
+@0 configure q 2 100 100
+= configured queue=q max_attempts=2 backoff_base=100 backoff_cap=100
+@0 enqueue q a1 order=a
+= enqueued job=1 queue=q ready_at=0 order=a
+@0 enqueue q a2 order=a
+= enqueued job=2 queue=q ready_at=0 order=a
+@0 enqueue q b1 order=b
+= enqueued job=3 queue=q ready_at=0 order=b
+@0 enqueue q free
+= enqueued job=4 queue=q ready_at=0
+@0 enqueue q a3 order=a
+= enqueued job=5 queue=q ready_at=0 order=a
+@1 lease q 1000
+= leased job=1 token=1 deadline=1001 attempt=1 payload=a1
+@1 lease q 1000
+= leased job=3 token=2 deadline=1001 attempt=1 payload=b1
+@1 lease q 1000
+= leased job=4 token=3 deadline=1001 attempt=1 payload=free
+# Jobs 2 and 5 wait behind job 1, so nothing else is leasable.
+@1 lease q 1000
+= empty queue=q
+# A job waiting for its retry keeps the key: job 2 is still not leasable.
+@2 nack 1 1
+= released job=1 token=1 reason=nack
+= retrying job=1 ready_at=59
+@100 lease q 1000
+= leased job=1 token=4 deadline=1100 attempt=2 payload=a1
+@100 ack 2 1
+= rejected reason=not_leased
+# Acking the first job lets the next one of its key go.
+@200 ack 1 4
+= acked job=1
+@200 lease q 1000
+= leased job=2 token=5 deadline=1200 attempt=1 payload=a2
+# Dead-lettering the first job also lets the next one go.
+@300 nack 2 5
+= released job=2 token=5 reason=nack
+= retrying job=2 ready_at=368
+@1000 lease q 1000
+= leased job=2 token=6 deadline=2000 attempt=2 payload=a2
+@1000 nack 2 6
+= released job=2 token=6 reason=nack
+= dead job=2
+@1000 lease q 1000
+= leased job=5 token=7 deadline=2000 attempt=1 payload=a3
+# A redriven job rejoins its key at the back, behind job 5.
+@1000 redrive q
+= redriven job=2
+@1000 lease q 1000
+= empty queue=q
+@1000 ack 5 7
+= acked job=5
+@1000 lease q 1000
+= leased job=2 token=8 deadline=2000 attempt=1 payload=a2

@@ -15,19 +15,23 @@
 //! tick      (8)
 //! complete (10) = job:u64 token:u64 payload          (D41)
 //! result   (11) = job:u64
+//! enqueue  (12) = queue payload delay:u64 has_key:u8 [key] order   (with an ordering key, D79)
+//! subscribe (13) = queue group:queue                  (D80)
 //! queue     = len:u8 bytes      (validated as a QueueName)
 //! payload   = len:u32 bytes
 //! key       = len:u8 bytes      (validated as a DedupKey)
+//! order     = len:u8 bytes      (validated as an OrderKey)
 //! ```
 //!
 //! A keyed enqueue has its own tag so that every log written before keys
-//! existed decodes unchanged (D35).
+//! existed decodes unchanged (D35); an ordered one too, for the same reason.
 //!
 //! Events, for replies on the wire (D33), in the same style:
 //!
 //! ```text
 //! events        = count:u32 event*
-//! enqueued  (1) = job:u64 queue ready_at:u64 has_key:u8 [key]
+//! enqueued  (1) = job:u64 queue ready_at:u64 flags:u8 [key] [order]
+//!                 (flags: 1 has a key, 2 has an ordering key)
 //! leased    (2) = job:u64 token:u64 deadline:u64 attempt:u32 payload
 //! empty     (3) = queue
 //! renewed   (4) = job:u64 token:u64 deadline:u64
@@ -38,10 +42,11 @@
 //! redriven  (9) = job:u64
 //! configured (10) = queue max_attempts:u32 backoff_base:u64 backoff_cap:u64
 //! rejected (11) = reason:u8      (1 unknown_job, 2 not_leased, 3 stale_token,
-//!                                 4 zero_visibility, 5 bad_config)
+//!                                 4 zero_visibility, 5 bad_config, 6 bad_group)
 //! deduplicated (12) = job:u64 queue key
 //! completed (13) = job:u64 token:u64
 //! result   (14) = job:u64 status:u8 [token:u64 payload]   (0 pending, 1 done, 2 unknown)
+//! subscribed (15) = queue group:queue
 //! ```
 //!
 //! Tag 0 is never used, so a run of zero bytes never decodes as a command.
@@ -50,7 +55,7 @@ use thiserror::Error;
 
 use crate::command::{Command, Event, Op, RejectReason, ReleaseReason, ResultStatus};
 use crate::retry::QueueConfig;
-use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};
+use crate::types::{DedupKey, JobId, Lease, Millis, OrderKey, Payload, QueueName, Time, Token};
 
 /// Bytes that are not a valid encoding.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -63,6 +68,8 @@ pub enum DecodeError {
     BadQueueName(Vec<u8>),
     #[error("invalid dedup key {0:?}")]
     BadKey(Vec<u8>),
+    #[error("invalid ordering key {0:?}")]
+    BadOrderKey(Vec<u8>),
     #[error("{0} bytes left over after the value")]
     TrailingBytes(usize),
     #[error("{0}")]
@@ -80,6 +87,8 @@ const TICK: u8 = 8;
 const ENQUEUE_KEYED: u8 = 9;
 const COMPLETE: u8 = 10;
 const RESULT: u8 = 11;
+const ENQUEUE_ORDERED: u8 = 12;
+const SUBSCRIBE: u8 = 13;
 
 /// Append the encoding of `cmd` to `out`.
 pub fn encode_command(cmd: &Command, out: &mut Vec<u8>) {
@@ -95,16 +104,20 @@ pub fn encode_op(op: &Op, out: &mut Vec<u8>) {
             payload,
             delay,
             key,
+            order,
         } => {
-            out.push(if key.is_some() {
-                ENQUEUE_KEYED
-            } else {
-                ENQUEUE
+            out.push(match (key, order) {
+                (_, Some(_)) => ENQUEUE_ORDERED,
+                (Some(_), None) => ENQUEUE_KEYED,
+                (None, None) => ENQUEUE,
             });
             put_name(out, queue);
             put_payload(out, payload);
             put_u64(out, delay.0);
-            if let Some(key) = key {
+            if let Some(order) = order {
+                put_flag(out, key.as_ref(), put_key);
+                put_order(out, order);
+            } else if let Some(key) = key {
                 put_key(out, key);
             }
         }
@@ -141,6 +154,11 @@ pub fn encode_op(op: &Op, out: &mut Vec<u8>) {
         Op::Redrive { queue } => {
             out.push(REDRIVE);
             put_name(out, queue);
+        }
+        Op::Subscribe { queue, group } => {
+            out.push(SUBSCRIBE);
+            put_name(out, queue);
+            put_name(out, group);
         }
         Op::Tick => out.push(TICK),
         Op::Complete { job, token, result } => {
@@ -189,6 +207,27 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             } else {
                 None
             },
+            order: None,
+        },
+        ENQUEUE_ORDERED => Op::Enqueue {
+            queue: r.name()?,
+            payload: r.payload()?,
+            delay: Millis(r.u64()?),
+            key: match r.u8()? {
+                0 => None,
+                1 => Some(r.key()?),
+                tag => {
+                    return Err(DecodeError::UnknownTag {
+                        what: "key flag",
+                        tag,
+                    });
+                }
+            },
+            order: Some(r.order()?),
+        },
+        SUBSCRIBE => Op::Subscribe {
+            queue: r.name()?,
+            group: r.name()?,
         },
         LEASE => Op::Lease {
             queue: r.name()?,
@@ -240,6 +279,11 @@ const REJECTED: u8 = 11;
 const DEDUPLICATED: u8 = 12;
 const COMPLETED: u8 = 13;
 const RESULT_EVENT: u8 = 14;
+const SUBSCRIBED: u8 = 15;
+
+/// `flags` bits of `enqueued`.
+const HAS_KEY: u8 = 1;
+const HAS_ORDER: u8 = 2;
 
 /// Append `events`, with their count, to `out` (D33).
 pub fn encode_events(events: &[Event], out: &mut Vec<u8>) {
@@ -278,17 +322,20 @@ pub fn encode_event(e: &Event, out: &mut Vec<u8>) {
             queue,
             ready_at,
             key,
+            order,
         } => {
             out.push(ENQUEUED);
             put_u64(out, job.0);
             put_name(out, queue);
             put_u64(out, ready_at.0);
-            match key {
-                None => out.push(0),
-                Some(key) => {
-                    out.push(1);
-                    put_key(out, key);
-                }
+            let flags = if key.is_some() { HAS_KEY } else { 0 }
+                | if order.is_some() { HAS_ORDER } else { 0 };
+            out.push(flags);
+            if let Some(key) = key {
+                put_key(out, key);
+            }
+            if let Some(order) = order {
+                put_order(out, order);
             }
         }
         Event::Leased {
@@ -348,7 +395,13 @@ pub fn encode_event(e: &Event, out: &mut Vec<u8>) {
                 RejectReason::StaleToken => 3,
                 RejectReason::ZeroVisibility => 4,
                 RejectReason::BadConfig => 5,
+                RejectReason::BadGroup => 6,
             });
+        }
+        Event::Subscribed { queue, group } => {
+            out.push(SUBSCRIBED);
+            put_name(out, queue);
+            put_name(out, group);
         }
         Event::Deduplicated { job, queue, key } => {
             out.push(DEDUPLICATED);
@@ -386,21 +439,31 @@ fn read_event(r: &mut Reader) -> Result<Event, DecodeError> {
         })
     };
     Ok(match r.u8()? {
-        ENQUEUED => Event::Enqueued {
-            job: JobId(r.u64()?),
-            queue: r.name()?,
-            ready_at: Time(r.u64()?),
-            key: match r.u8()? {
-                0 => None,
-                1 => Some(r.key()?),
-                tag => {
-                    return Err(DecodeError::UnknownTag {
-                        what: "key flag",
-                        tag,
-                    });
-                }
-            },
-        },
+        ENQUEUED => {
+            let (job, queue, ready_at) = (JobId(r.u64()?), r.name()?, Time(r.u64()?));
+            let flags = r.u8()?;
+            if flags & !(HAS_KEY | HAS_ORDER) != 0 {
+                return Err(DecodeError::UnknownTag {
+                    what: "enqueued flags",
+                    tag: flags,
+                });
+            }
+            Event::Enqueued {
+                job,
+                queue,
+                ready_at,
+                key: if flags & HAS_KEY != 0 {
+                    Some(r.key()?)
+                } else {
+                    None
+                },
+                order: if flags & HAS_ORDER != 0 {
+                    Some(r.order()?)
+                } else {
+                    None
+                },
+            }
+        }
         LEASED => Event::Leased {
             lease: lease(r)?,
             attempt: r.u32()?,
@@ -446,6 +509,7 @@ fn read_event(r: &mut Reader) -> Result<Event, DecodeError> {
                 3 => RejectReason::StaleToken,
                 4 => RejectReason::ZeroVisibility,
                 5 => RejectReason::BadConfig,
+                6 => RejectReason::BadGroup,
                 tag => {
                     return Err(DecodeError::UnknownTag {
                         what: "reject reason",
@@ -480,6 +544,10 @@ fn read_event(r: &mut Reader) -> Result<Event, DecodeError> {
                 }
             },
         },
+        SUBSCRIBED => Event::Subscribed {
+            queue: r.name()?,
+            group: r.name()?,
+        },
         tag => return Err(DecodeError::UnknownTag { what: "event", tag }),
     })
 }
@@ -502,6 +570,23 @@ pub(crate) fn put_key(out: &mut Vec<u8>, key: &DedupKey) {
     // DedupKey::new caps keys at 128 bytes, so the length fits a u8.
     out.push(key.as_str().len() as u8);
     out.extend_from_slice(key.as_str().as_bytes());
+}
+
+pub(crate) fn put_order(out: &mut Vec<u8>, key: &OrderKey) {
+    // OrderKey::new caps keys at 128 bytes, so the length fits a u8.
+    out.push(key.as_str().len() as u8);
+    out.extend_from_slice(key.as_str().as_bytes());
+}
+
+/// `0`, or `1` followed by `value`.
+fn put_flag<T>(out: &mut Vec<u8>, value: Option<&T>, put: fn(&mut Vec<u8>, &T)) {
+    match value {
+        None => out.push(0),
+        Some(v) => {
+            out.push(1);
+            put(out, v);
+        }
+    }
 }
 
 pub(crate) fn put_payload(out: &mut Vec<u8>, payload: &Payload) {
@@ -540,6 +625,10 @@ impl<'a> Reader<'a> {
         Ok(self.bytes(1)?[0])
     }
 
+    pub(crate) fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+    }
+
     pub(crate) fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
@@ -564,6 +653,15 @@ impl<'a> Reader<'a> {
             .ok()
             .and_then(|s| DedupKey::new(s).ok())
             .ok_or_else(|| DecodeError::BadKey(bytes.to_vec()))
+    }
+
+    pub(crate) fn order(&mut self) -> Result<OrderKey, DecodeError> {
+        let len = self.u8()?;
+        let bytes = self.bytes(len.into())?;
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| OrderKey::new(s).ok())
+            .ok_or_else(|| DecodeError::BadOrderKey(bytes.to_vec()))
     }
 
     pub(crate) fn op(&mut self) -> Result<Op, DecodeError> {
@@ -663,6 +761,7 @@ mod tests {
                     queue: QueueName::new("q").unwrap(),
                     ready_at: Time(2),
                     key: Some(DedupKey::new("k").unwrap()),
+                    order: None,
                 },
             ],
             &mut out,
@@ -708,12 +807,12 @@ mod tests {
         let mut bytes = one(Event::Rejected {
             reason: RejectReason::BadConfig,
         });
-        bytes[5] = 6;
+        bytes[5] = 7;
         assert_eq!(
             decode_events(&bytes),
             Err(DecodeError::UnknownTag {
                 what: "reject reason",
-                tag: 6
+                tag: 7
             })
         );
         // A count the input cannot possibly hold, without allocating for it.
@@ -777,7 +876,7 @@ mod tests {
         bytes.push(0);
         assert_eq!(decode_command(&bytes), Err(DecodeError::TrailingBytes(1)));
 
-        for tag in [0, 12, 255] {
+        for tag in [0, 14, 255] {
             let mut bytes = encode("@1 tick");
             bytes[8] = tag;
             assert_eq!(

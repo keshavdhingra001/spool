@@ -8,7 +8,7 @@
 //! Every command starts with its logical time in milliseconds (D9):
 //!
 //! ```text
-//! @<ms> enqueue   <queue> <payload> [delay=<ms>] [key=<key>]
+//! @<ms> enqueue   <queue> <payload> [delay=<ms>] [key=<key>] [order=<key>]
 //! @<ms> lease     <queue> <visibility_ms>
 //! @<ms> heartbeat <job> <token> <visibility_ms>
 //! @<ms> ack       <job> <token>
@@ -17,6 +17,7 @@
 //! @<ms> nack      <job> <token>
 //! @<ms> configure <queue> <max_attempts> <backoff_base_ms> <backoff_cap_ms>
 //! @<ms> redrive   <queue>
+//! @<ms> subscribe <queue> <group>
 //! @<ms> tick
 //! ```
 
@@ -25,7 +26,7 @@ use std::str::FromStr;
 
 use crate::error::ParseError;
 use crate::retry::QueueConfig;
-use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};
+use crate::types::{DedupKey, JobId, Lease, Millis, OrderKey, Payload, QueueName, Time, Token};
 
 /// One input to the queue: an operation stamped with the time it happens at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,12 +42,15 @@ pub enum Op {
     /// Add a job to `queue`, leasable from `now + delay` (D17). The queue
     /// assigns its id (D10) and creates the queue with default settings if needed.
     /// With a `key` already used in `queue` within the last 5 minutes, nothing is
-    /// added and the original job's id is returned (D35).
+    /// added and the original job's id is returned (D35). Jobs with the same
+    /// `order` key are leased one at a time, in enqueue order (D79). A queue
+    /// with consumer groups gets one job in each group's queue instead (D80).
     Enqueue {
         queue: QueueName,
         payload: Payload,
         delay: Millis,
         key: Option<DedupKey>,
+        order: Option<OrderKey>,
     },
     /// Lease the ready job with the smallest `(ready_at, id)` in `queue` (D18), hidden from other workers until
     /// `now + visibility`.
@@ -84,6 +88,9 @@ pub enum Op {
     },
     /// Move every dead job of `queue` back to ready, with its attempts reset (D16).
     Redrive { queue: QueueName },
+    /// Give `queue` the consumer group `group` (D80): from now on each enqueue
+    /// to `queue` adds a job to `<queue>:<group>`. Repeating it changes nothing.
+    Subscribe { queue: QueueName, group: QueueName },
     /// Only advance the clock, expiring leases that are past their deadline.
     Tick,
 }
@@ -96,6 +103,7 @@ pub enum Event {
         queue: QueueName,
         ready_at: Time,
         key: Option<DedupKey>,
+        order: Option<OrderKey>,
     },
     /// A keyed enqueue repeated a key still in its window (D35): nothing was
     /// added, and `job` is the job the key's first enqueue created.
@@ -138,6 +146,8 @@ pub enum Event {
         queue: QueueName,
         config: QueueConfig,
     },
+    /// `queue` has the consumer group `group` (D80).
+    Subscribed { queue: QueueName, group: QueueName },
     /// The command was refused and changed nothing except the clock.
     Rejected { reason: RejectReason },
 }
@@ -173,6 +183,10 @@ pub enum RejectReason {
     ZeroVisibility,
     /// `configure` with `max_attempts` 0 or a base above the cap.
     BadConfig,
+    /// `subscribe` naming a group's queue, or a pair whose group queue name
+    /// would be too long; or `enqueue` to a group's queue, which only an
+    /// enqueue to its queue fills (D80).
+    BadGroup,
 }
 
 impl FromStr for Command {
@@ -190,8 +204,8 @@ impl FromStr for Command {
             .ok_or_else(|| ParseError::UnknownCommand(String::new()))?;
         let op = match name {
             "enqueue" => {
-                expect_args("enqueue", args, 2..=4, "2 to 4")?;
-                let (mut delay, mut key) = (None, None);
+                expect_args("enqueue", args, 2..=5, "2 to 5")?;
+                let (mut delay, mut key, mut order) = (None, None, None);
                 for &arg in &args[2..] {
                     if let Some(ms) = arg.strip_prefix("delay=") {
                         if delay.replace(Millis(parse_num("delay", ms)?)).is_some() {
@@ -200,6 +214,10 @@ impl FromStr for Command {
                     } else if let Some(k) = arg.strip_prefix("key=") {
                         if key.replace(DedupKey::new(k)?).is_some() {
                             return Err(ParseError::DuplicateOption("key".into()));
+                        }
+                    } else if let Some(k) = arg.strip_prefix("order=") {
+                        if order.replace(OrderKey::new(k)?).is_some() {
+                            return Err(ParseError::DuplicateOption("order".into()));
                         }
                     } else {
                         return Err(ParseError::BadOption(arg.to_string()));
@@ -210,6 +228,7 @@ impl FromStr for Command {
                     payload: Payload::parse(args[1])?,
                     delay: delay.unwrap_or_default(),
                     key,
+                    order,
                 }
             }
             "lease" => {
@@ -272,6 +291,13 @@ impl FromStr for Command {
                     queue: QueueName::new(args[0])?,
                 }
             }
+            "subscribe" => {
+                expect_args("subscribe", args, 2..=2, "2")?;
+                Op::Subscribe {
+                    queue: QueueName::new(args[0])?,
+                    group: QueueName::new(args[1])?,
+                }
+            }
             "tick" => {
                 expect_args("tick", args, 0..=0, "0")?;
                 Op::Tick
@@ -323,6 +349,7 @@ impl fmt::Display for Command {
                 payload,
                 delay,
                 key,
+                order,
             } => {
                 write!(f, "enqueue {queue} {payload}")?;
                 // Delay 0 is the default and is left out, so each command has one line form.
@@ -331,6 +358,9 @@ impl fmt::Display for Command {
                 }
                 if let Some(key) = key {
                     write!(f, " key={key}")?;
+                }
+                if let Some(order) = order {
+                    write!(f, " order={order}")?;
                 }
                 Ok(())
             }
@@ -346,6 +376,7 @@ impl fmt::Display for Command {
             Op::Result { job } => write!(f, "result {job}"),
             Op::Configure { queue, config } => write!(f, "configure {queue} {config}"),
             Op::Redrive { queue } => write!(f, "redrive {queue}"),
+            Op::Subscribe { queue, group } => write!(f, "subscribe {queue} {group}"),
             Op::Tick => write!(f, "tick"),
         }
     }
@@ -360,10 +391,14 @@ impl fmt::Display for Event {
                 queue,
                 ready_at,
                 key,
+                order,
             } => {
                 write!(f, "enqueued job={job} queue={queue} ready_at={ready_at}")?;
                 if let Some(key) = key {
                     write!(f, " key={key}")?;
+                }
+                if let Some(order) = order {
+                    write!(f, " order={order}")?;
                 }
                 Ok(())
             }
@@ -407,6 +442,9 @@ impl fmt::Display for Event {
                 "configured queue={queue} max_attempts={} backoff_base={} backoff_cap={}",
                 config.max_attempts, config.backoff_base, config.backoff_cap
             ),
+            Event::Subscribed { queue, group } => {
+                write!(f, "subscribed queue={queue} group={group}")
+            }
             Event::Rejected { reason } => write!(f, "rejected reason={reason}"),
         }
     }
@@ -429,6 +467,7 @@ impl fmt::Display for RejectReason {
             RejectReason::StaleToken => "stale_token",
             RejectReason::ZeroVisibility => "zero_visibility",
             RejectReason::BadConfig => "bad_config",
+            RejectReason::BadGroup => "bad_group",
         })
     }
 }
@@ -457,6 +496,7 @@ mod tests {
                         payload: Payload(b"send:42".to_vec()),
                         delay: Millis(0),
                         key: None,
+                        order: None,
                     },
                 ),
             ),
@@ -469,6 +509,7 @@ mod tests {
                         payload: Payload(Vec::new()),
                         delay: Millis(500),
                         key: None,
+                        order: None,
                     },
                 ),
             ),
@@ -481,6 +522,7 @@ mod tests {
                         payload: Payload(b"x".to_vec()),
                         delay: Millis(5),
                         key: Some(DedupKey::new("order-7").unwrap()),
+                        order: None,
                     },
                 ),
             ),
@@ -602,11 +644,16 @@ mod tests {
             ),
             ("@1", UnknownCommand(String::new())),
             ("@1 push q x", UnknownCommand("push".into())),
-            ("@1 enqueue q", wrong("enqueue", "2 to 4", 1)),
+            ("@1 enqueue q", wrong("enqueue", "2 to 5", 1)),
             (
-                "@1 enqueue q a delay=1 key=k b",
-                wrong("enqueue", "2 to 4", 5),
+                "@1 enqueue q a delay=1 key=k order=o b",
+                wrong("enqueue", "2 to 5", 6),
             ),
+            (
+                "@1 enqueue q a order=x order=y",
+                DuplicateOption("order".into()),
+            ),
+            ("@1 enqueue q a order=", BadOrderKey(String::new())),
             (
                 "@1 enqueue q a delay=1 delay=2",
                 DuplicateOption("delay".into()),
@@ -656,6 +703,7 @@ mod tests {
                     queue: q("emails"),
                     ready_at: Time(500),
                     key: None,
+                    order: None,
                 },
                 "enqueued job=3 queue=emails ready_at=500",
             ),
@@ -665,6 +713,7 @@ mod tests {
                     queue: q("emails"),
                     ready_at: Time(500),
                     key: Some(DedupKey::new("k1").unwrap()),
+                    order: None,
                 },
                 "enqueued job=3 queue=emails ready_at=500 key=k1",
             ),

@@ -5,11 +5,11 @@
 //! what the queue said. A bug that corrupts both the state and the checker's view
 //! of it (or emits events that disagree with the state) is caught here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::command::{Event, ResultStatus};
 use crate::reference::{Counts, JobState, ReferenceQueue};
-use crate::types::{DedupKey, JobId, Payload, QueueName, Token};
+use crate::types::{DedupKey, JobId, OrderKey, Payload, QueueName, Token};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -27,11 +27,16 @@ struct Entry {
     attempts: u32,
     /// Learned from the first lease; every later lease must carry the same bytes.
     payload: Option<Payload>,
+    /// The job's queue and ordering key, if it has one (D79).
+    order: Option<(QueueName, OrderKey)>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Ledger {
     jobs: BTreeMap<JobId, Entry>,
+    /// The partition whose ids the queue assigns (D77).
+    partition: u16,
+    /// How many ids were assigned, counted below the partition's bits.
     last_job: u64,
     last_token: u64,
     acked: u64,
@@ -43,11 +48,26 @@ pub struct Ledger {
     /// payload once a `result` event has shown it. Kept forever, since the
     /// ledger cannot tell when a result's window ends.
     completed: BTreeMap<JobId, (Token, Option<Payload>)>,
+    /// Per ordering key, its waiting and leased jobs in the order they may be
+    /// leased (D79), rebuilt from `enqueued`, `redriven` and the events that
+    /// end a job.
+    orders: BTreeMap<(QueueName, OrderKey), VecDeque<JobId>>,
+    /// Dedup keys set by the command being observed: a fan-out's later jobs
+    /// leave the key on the first (D80).
+    fresh_keys: Vec<(QueueName, DedupKey)>,
 }
 
 impl Ledger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A ledger for the queue of `partition` (D77).
+    pub fn for_partition(partition: u16) -> Self {
+        Ledger {
+            partition,
+            ..Self::default()
+        }
     }
 
     /// A ledger that starts from a recovered queue instead of from nothing,
@@ -56,7 +76,7 @@ impl Ledger {
     /// lower bound: every check from here on is as strict, except that a token
     /// reused from an acked job would go unnoticed.
     pub fn resume(queue: &ReferenceQueue) -> Self {
-        let mut l = Ledger::new();
+        let mut l = Ledger::for_partition(queue.partition());
         let c = queue.counts();
         l.acked = c.acked;
         for job in queue.jobs() {
@@ -74,8 +94,12 @@ impl Ledger {
                     state,
                     attempts: job.attempts,
                     payload: None,
+                    order: job.order.map(|o| (job.queue.clone(), o)),
                 },
             );
+        }
+        for (key, ids) in queue.orders() {
+            l.orders.insert(key, ids.into());
         }
         // Every id up to the last one is live or acked (D19).
         l.last_job = l.jobs.len() as u64 + c.acked;
@@ -90,6 +114,7 @@ impl Ledger {
 
     /// Check the events one command produced, in order, and apply them.
     pub fn observe(&mut self, events: &[Event]) -> Result<(), String> {
+        self.fresh_keys.clear();
         for event in events {
             self.observe_one(event)
                 .map_err(|e| format!("event `{event}`: {e}"))?;
@@ -103,14 +128,33 @@ impl Ledger {
     fn observe_one(&mut self, event: &Event) -> Result<(), String> {
         match event {
             Event::Enqueued {
-                job, queue, key, ..
+                job,
+                queue,
+                key,
+                order,
+                ..
             } => {
-                if job.0 != self.last_job + 1 {
-                    return Err(format!("expected id {}", self.last_job + 1));
+                let expected = JobId::new(self.partition, self.last_job + 1);
+                if *job != expected {
+                    return Err(format!("expected id {expected}"));
                 }
-                self.last_job = job.0;
+                self.last_job += 1;
+                // With consumer groups the key names the first group's job
+                // (D80), whose queue is `<queue>:<group>`.
                 if let Some(key) = key {
-                    self.keys.insert((queue.clone(), key.clone()), *job);
+                    let base = match queue.as_str().split_once(':') {
+                        Some((base, _)) => QueueName::new(base).expect("part of a valid name"),
+                        None => queue.clone(),
+                    };
+                    let k = (base, key.clone());
+                    if !self.fresh_keys.contains(&k) {
+                        self.keys.insert(k.clone(), *job);
+                        self.fresh_keys.push(k);
+                    }
+                }
+                let order = order.clone().map(|o| (queue.clone(), o));
+                if let Some(k) = &order {
+                    self.orders.entry(k.clone()).or_default().push_back(*job);
                 }
                 self.jobs.insert(
                     *job,
@@ -118,6 +162,7 @@ impl Ledger {
                         state: State::Waiting,
                         attempts: 0,
                         payload: None,
+                        order,
                     },
                 );
             }
@@ -130,6 +175,17 @@ impl Ledger {
                     return Err(format!("token not above {}", self.last_token));
                 }
                 self.last_token = lease.token.0;
+                // Only the first job of an ordering key may be leased (D79).
+                let order = self.jobs.get(&lease.job).and_then(|e| e.order.clone());
+                if let Some(k) = &order {
+                    let first = self.orders.get(k).and_then(|ids| ids.front());
+                    if first != Some(&lease.job) {
+                        return Err(format!(
+                            "ordering key {}/{} has job {first:?} first",
+                            k.0, k.1
+                        ));
+                    }
+                }
                 let e = self.entry(lease.job, State::Waiting)?;
                 if *attempt != e.attempts + 1 {
                     return Err(format!("attempt should be {}", e.attempts + 1));
@@ -149,6 +205,7 @@ impl Ledger {
                 if !matches!(state, Some(State::Leased(_))) {
                     return Err(format!("acked in state {state:?}"));
                 }
+                self.leave_order(*job);
                 self.jobs.remove(job);
                 self.acked += 1;
             }
@@ -160,6 +217,7 @@ impl Ledger {
                     }
                 } else {
                     self.entry(*job, State::Leased(*token))?;
+                    self.leave_order(*job);
                     self.jobs.remove(job);
                     self.acked += 1;
                     self.completed.insert(*job, (*token, None));
@@ -197,11 +255,16 @@ impl Ledger {
             }
             Event::DeadLettered { job } => {
                 self.entry(*job, State::Released)?.state = State::Dead;
+                self.leave_order(*job);
             }
             Event::Redriven { job } => {
                 let e = self.entry(*job, State::Dead)?;
                 e.state = State::Waiting;
                 e.attempts = 0;
+                // Back of its ordering key (D79).
+                if let Some(k) = e.order.clone() {
+                    self.orders.entry(k).or_default().push_back(*job);
+                }
             }
             Event::Deduplicated { job, queue, key } => {
                 let first = self.keys.get(&(queue.clone(), key.clone()));
@@ -209,9 +272,25 @@ impl Ledger {
                     return Err(format!("key was last enqueued as {first:?}"));
                 }
             }
-            Event::Empty { .. } | Event::Configured { .. } | Event::Rejected { .. } => {}
+            Event::Empty { .. }
+            | Event::Configured { .. }
+            | Event::Subscribed { .. }
+            | Event::Rejected { .. } => {}
         }
         Ok(())
+    }
+
+    /// `job` is done with its ordering key: acked, completed or dead.
+    fn leave_order(&mut self, job: JobId) {
+        let Some(k) = self.jobs.get(&job).and_then(|e| e.order.clone()) else {
+            return;
+        };
+        if let Some(ids) = self.orders.get_mut(&k) {
+            ids.retain(|&j| j != job);
+            if ids.is_empty() {
+                self.orders.remove(&k);
+            }
+        }
     }
 
     /// The job's entry, which must be in state `expected`.
@@ -252,6 +331,7 @@ mod tests {
             queue: QueueName::new("a").unwrap(),
             ready_at: Time(0),
             key: None,
+            order: None,
         }
     }
 
@@ -261,6 +341,7 @@ mod tests {
             queue: QueueName::new("a").unwrap(),
             ready_at: Time(0),
             key: Some(DedupKey::new(key).unwrap()),
+            order: None,
         }
     }
 

@@ -20,6 +20,15 @@ impl Checked {
         Self::default()
     }
 
+    /// The queue of `partition` (D77), checked.
+    pub fn for_partition(partition: u16) -> Self {
+        Checked {
+            queue: ReferenceQueue::for_partition(partition),
+            ledger: Ledger::for_partition(partition),
+            out: Vec::new(),
+        }
+    }
+
     /// Apply `cmd` and return its events, or the first violated invariant.
     pub fn apply(&mut self, cmd: &Command) -> Result<&[Event], String> {
         self.out.clear();

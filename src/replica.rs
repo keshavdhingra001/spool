@@ -357,6 +357,7 @@ mod tests {
             payload: Payload(vec![n]),
             delay: Millis(0),
             key: None,
+            order: None,
         }
     }
 

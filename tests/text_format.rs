@@ -4,10 +4,17 @@
 
 use proptest::prelude::*;
 use spool::codec::{decode_command, encode_command};
-use spool::{Command, DedupKey, JobId, Millis, Op, Payload, QueueConfig, QueueName, Time, Token};
+use spool::{
+    Command, DedupKey, JobId, Millis, Op, OrderKey, Payload, QueueConfig, QueueName, Time, Token,
+};
 
+/// A plain queue name, or a consumer group's `<queue>:<group>` (D80).
 fn queue() -> impl Strategy<Value = QueueName> {
-    "[A-Za-z0-9_.-]{1,64}".prop_map(|s| QueueName::new(&s).unwrap())
+    prop_oneof![
+        "[A-Za-z0-9_.-]{1,64}",
+        "[A-Za-z0-9_.-]{1,31}:[A-Za-z0-9_.-]{1,32}",
+    ]
+    .prop_map(|s| QueueName::new(&s).unwrap())
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -20,13 +27,16 @@ fn op() -> impl Strategy<Value = Op> {
             prop::collection::vec(any::<u8>(), 0..40),
             ms.clone(),
             prop::option::of("[!-~]{1,128}"),
+            prop::option::of("[!-~]{1,128}"),
         )
-            .prop_map(|(queue, bytes, delay, key)| Op::Enqueue {
+            .prop_map(|(queue, bytes, delay, key, order)| Op::Enqueue {
                 queue,
                 payload: Payload(bytes),
                 delay,
                 key: key.map(|k| DedupKey::new(&k).unwrap()),
+                order: order.map(|k| OrderKey::new(&k).unwrap()),
             }),
+        (queue(), queue()).prop_map(|(queue, group)| Op::Subscribe { queue, group }),
         (queue(), any::<u32>(), ms.clone(), ms.clone()).prop_map(|(queue, n, base, cap)| {
             Op::Configure {
                 queue,

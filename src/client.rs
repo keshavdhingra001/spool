@@ -271,6 +271,7 @@ impl Router {
                 payload,
                 delay,
                 key: None,
+                order,
             } => {
                 let n = self.next_key.fetch_add(1, Ordering::Relaxed);
                 let key = DedupKey::new(&format!("{}-{n:x}", self.keys)).expect("a valid key");
@@ -279,6 +280,7 @@ impl Router {
                     payload,
                     delay,
                     key: Some(key),
+                    order,
                 }
             }
             op => op,
@@ -404,6 +406,7 @@ impl Client {
             payload,
             delay,
             key,
+            order: None,
         };
         match self.outcome(op).await? {
             Event::Enqueued { job, .. } => Ok(Enqueued {
@@ -528,6 +531,7 @@ mod tests {
             payload: Payload(vec![]),
             delay: Millis(0),
             key: key.map(|k| DedupKey::new(k).unwrap()),
+            order: None,
         };
         let key = |op: Op| match op {
             Op::Enqueue { key, .. } => key,

@@ -583,10 +583,10 @@ mod tests {
     #[test]
     fn loads_a_version_1_snapshot() {
         // Rewrite run(8, 3)'s snapshot as M2 wrote it: version 1, without the
-        // key and result tables (D35, D45).
+        // key and result tables (D35, D45) and M8's (16 + 22 bytes, empty).
         let mut files = run(8, 3).files();
         let snap = files.get_mut("snap-00000000000000000006").unwrap();
-        snap.truncate(snap.len() - 16);
+        snap.truncate(snap.len() - 16 - 22);
         reseal(snap, 1);
         let (mut d, rec) = reopen(files).unwrap();
         assert_eq!((rec.snapshot_lsn, rec.replayed), (6, 2));

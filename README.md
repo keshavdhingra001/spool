@@ -5,7 +5,7 @@ Postgres underneath), leases with visibility timeouts and fencing tokens, effect
 processing, partition testing by deterministic simulation, and Raft replication written from
 scratch.
 
-**Status:** M7. Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
+**Status:** M8. Tier 1 complete. A single-node queue: leases with visibility timeouts and fencing tokens, heartbeats,
 ack/nack, retries with capped exponential backoff, delayed jobs, a dead-letter state with redrive
 (M1). Durable (M2): every command goes into a checksummed write-ahead log and is synced before
 its result is returned, with periodic snapshots and recovery that is tested by failing at every
@@ -30,7 +30,13 @@ runs on that Raft, one server batch per log entry, every op (reads too) answered
 entry commits with the term it was proposed in; followers redirect, and the cluster client follows
 leaders and retries, giving every enqueue a dedup key so a retry never adds a job (D66–D73). The M5
 producers, workers and fenced store run against 3- or 5-replica clusters in the simulator, and
-three `spool serve --cluster` processes survive `kill -9` of their leader.
+three `spool serve --cluster` processes survive `kill -9` of their leader. Partitioned (M8): a
+cluster runs a fixed number of partitions, each its own Raft group with a replica on every node
+(D74, D75); the client routes an enqueue by its ordering key, else its dedup key, and every other
+op by the partition in its job id (D76, D77), and a worker's leases rotate over the partitions
+(D78). Jobs with the same ordering key are leased one at a time, in enqueue order (D79), and a
+queue's consumer groups each get a copy of every job (D80). The simulator runs 1 to 3 partitions
+and checks ordering from the applied events alone (D82).
 Design decisions with alternatives and reasons are in [DESIGN.md](DESIGN.md).
 
 ## Design in one paragraph
@@ -182,6 +188,28 @@ Its planted bugs (D73) are `reply-before-commit` (the leader answers before the 
 `ignore-term-on-reply` (the leader answers with whatever entry took its proposal's index); the
 queue's `no-fence` and `no-dedup-key` work there too.
 
+With partitions (M8), every node is started with the same `--partitions <p>` and keeps each
+partition's Raft log in `<dir>/p<n>`; the client is told the count too:
+
+```
+cargo run -- serve --data /tmp/n0 --id 0 --cluster 0=127.0.0.1:7001,... --partitions 3
+cargo run -- connect --cluster 0=127.0.0.1:7001,1=127.0.0.1:7002,2=127.0.0.1:7003 --partitions 3
+```
+
+Ordering keys and consumer groups work in every mode, the REPL included:
+
+```
+> @0 enqueue q a1 order=user-7
+> @0 enqueue q a2 order=user-7        leased only once a1 is acked, completed or dead (D79)
+> @0 subscribe emails audit
+> @0 enqueue emails m1                one job in emails:audit, one per group (D80)
+```
+
+`sim --cluster` picks 1 to 3 partitions per seed (`--partitions <p>` fixes it). Its M8 planted
+bugs (D82) are `wrong-partition` (a producer resends an enqueue to another partition) and
+`ignore-order-key` (the queue leases any job of a key); `--no-checks` turns off the replicas' own
+checkers, to show the world's ordering check finds the second alone.
+
 Type `help` for every command (D12), `jobs` to see the queue, `run tests/scenarios/retry.txt` to run a
 scenario file (D20).
 
@@ -197,6 +225,6 @@ scenario file (D20).
 | M5 | Deterministic simulator: network, disk and clock from one seed, fault injection (done) |
 | M6 | Raft from scratch: election, replication, commit, tested in the simulator (done) |
 | M7 | The queue on Raft: batches as entries, redirects, retries with dedup keys (done) |
-| M8 | Partitioning across Raft groups |
+| M8 | Partitions as Raft groups, ordering keys, consumer groups (done) |
 | M9 | Jepsen-style history checker |
 | M10–M12 | Real processes under a fault proxy, benchmarks, write-up |

@@ -37,12 +37,12 @@ impl Cluster {
             servers: BTreeMap::new(),
         };
         for (id, listener) in listeners {
-            c.start_one(id, MemStorage::new(), listener).await;
+            c.start_one(id, vec![MemStorage::new()], listener).await;
         }
         c
     }
 
-    async fn start_one(&mut self, id: u32, storage: MemStorage, listener: TcpListener) {
+    async fn start_one(&mut self, id: u32, storage: Vec<MemStorage>, listener: TcpListener) {
         let options = ClusterOptions {
             check: true,
             ..ClusterOptions::new(id, self.members.clone())
@@ -76,10 +76,16 @@ impl Cluster {
         panic!("no leader within 5 s");
     }
 
-    async fn stop(&mut self, id: u32) -> MemStorage {
+    /// Stop replica `id` and return its storage, one per partition.
+    async fn stop(&mut self, id: u32) -> Vec<MemStorage> {
         let stopped = self.servers.remove(&id).unwrap().shutdown().await;
-        stopped.result.unwrap();
-        stopped.storage
+        stopped
+            .into_iter()
+            .map(|s| {
+                s.result.unwrap();
+                s.storage
+            })
+            .collect()
     }
 }
 
@@ -147,9 +153,10 @@ async fn three_replicas_serve_the_queue_and_followers_redirect() {
         }
     }
     for (_, s) in c.servers {
-        let stopped = s.shutdown().await;
-        stopped.result.unwrap();
-        assert!(stopped.stats.commands > 0 || stopped.stats.batches == 0);
+        for stopped in s.shutdown().await {
+            stopped.result.unwrap();
+            assert!(stopped.stats.commands > 0 || stopped.stats.batches == 0);
+        }
     }
 }
 
@@ -232,7 +239,7 @@ async fn shutdown_does_not_wait_for_a_request_that_cannot_commit() {
     let stopped = tokio::time::timeout(Duration::from_secs(5), server.shutdown())
         .await
         .expect("shutdown finished");
-    stopped.result.unwrap();
+    stopped[0].result.as_ref().unwrap();
     // The client learns nothing: its connection closes without an answer.
     assert!(stuck.await.unwrap().is_err());
 }

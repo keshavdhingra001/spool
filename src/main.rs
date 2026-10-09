@@ -87,8 +87,9 @@ const USAGE: &str = "\
 usage: spool                                   REPL, in memory
        spool --data <dir>                      REPL, durable
        spool serve --data <dir> [--listen <addr>]   serve over TCP (default 127.0.0.1:7878)
-       spool serve --data <dir> --id <n> --cluster <id>=<addr>,...
-                                               serve as replica n of a cluster (M7)
+       spool serve --data <dir> --id <n> --cluster <id>=<addr>,... [--partitions <p>]
+                                               serve as replica n of a cluster (M7) with p
+                                               partitions (M8, default 1; the same on every node)
        spool connect <addr>                    REPL against a server
        spool connect --cluster <id>=<addr>,... REPL against a cluster
        spool sim --seed <n> [--trace] [--bug <bug>]     run one simulation seed
@@ -323,8 +324,32 @@ fn members(spec: &str) -> BTreeMap<u32, SocketAddr> {
     }
 }
 
+/// `[--partitions <p>]`: how many partitions a cluster has (D74), 1 by default.
+fn partitions(rest: &[&str]) -> u16 {
+    match rest {
+        [] => 1,
+        ["--partitions", p] => match p.parse::<u16>() {
+            Ok(p) if (1..=spool::cluster::MAX_PARTITIONS as u16).contains(&p) => p,
+            _ => {
+                eprintln!(
+                    "bad partition count {p}: expected 1 to {}",
+                    spool::cluster::MAX_PARTITIONS
+                );
+                std::process::exit(2);
+            }
+        },
+        _ => usage(),
+    }
+}
+
 /// Serve as replica `id` until Ctrl-C (exit 0) or until it fails (exit 1).
-fn serve_cluster(dir: &Path, id: u32, members: BTreeMap<u32, SocketAddr>) -> io::Result<()> {
+/// Partition `p` keeps its Raft log in `<dir>/p<p>` (D81).
+fn serve_cluster(
+    dir: &Path,
+    id: u32,
+    members: BTreeMap<u32, SocketAddr>,
+    partitions: u16,
+) -> io::Result<()> {
     let Some(&listen) = members.get(&id) else {
         eprintln!("replica {id} is not in the cluster");
         std::process::exit(2);
@@ -332,9 +357,11 @@ fn serve_cluster(dir: &Path, id: u32, members: BTreeMap<u32, SocketAddr>) -> io:
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let started = async {
-            let storage = FileStorage::open(dir)?;
+            let storages = (0..partitions)
+                .map(|p| FileStorage::open(&dir.join(format!("p{p}"))))
+                .collect::<io::Result<Vec<_>>>()?;
             let listener = tokio::net::TcpListener::bind(listen).await?;
-            let server = ClusterServer::start(storage, listener, ClusterOptions::new(id, members))
+            let server = ClusterServer::start(storages, listener, ClusterOptions::new(id, members))
                 .await
                 .map_err(io::Error::other)?;
             io::Result::Ok(server)
@@ -346,17 +373,23 @@ fn serve_cluster(dir: &Path, id: u32, members: BTreeMap<u32, SocketAddr>) -> io:
                 std::process::exit(1);
             }
         };
-        println!("replica {id} listening on {}", server.local_addr());
+        println!(
+            "replica {id} listening on {}, {partitions} partition(s)",
+            server.local_addr()
+        );
         io::stdout().flush()?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                let stopped = server.shutdown().await;
-                eprintln!("shut down: {:?}", stopped.stats);
-                stopped.result.map_err(io::Error::other)
+                let mut result = Ok(());
+                for (p, stopped) in server.shutdown().await.into_iter().enumerate() {
+                    eprintln!("partition {p} shut down: {:?}", stopped.stats);
+                    result = result.and(stopped.result);
+                }
+                result.map_err(io::Error::other)
             }
-            stopped = server.stopped() => {
+            (p, stopped) = server.stopped() => {
                 let e = stopped.result.err().map_or("stopped".to_string(), |e| e.to_string());
-                eprintln!("fatal: {e}; restart to recover");
+                eprintln!("fatal: partition {p}: {e}; restart to recover");
                 std::process::exit(1);
             }
         }
@@ -417,9 +450,18 @@ fn main() -> io::Result<()> {
                 std::process::exit(2);
             }
         },
-        ["serve", "--data", dir, "--id", id, "--cluster", spec] => {
+        [
+            "serve",
+            "--data",
+            dir,
+            "--id",
+            id,
+            "--cluster",
+            spec,
+            rest @ ..,
+        ] => {
             let id = id.parse().unwrap_or_else(|_| usage());
-            return serve_cluster(Path::new(dir), id, members(spec));
+            return serve_cluster(Path::new(dir), id, members(spec), partitions(rest));
         }
         ["connect", "--cluster", spec] => return connect(&format!("cluster:{spec}")),
         ["connect", addr] => return connect(addr),

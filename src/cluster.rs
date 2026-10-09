@@ -1,21 +1,23 @@
 //! A replicated queue server (M7, D66–D73): the TCP front of the single-node
-//! server (D30) in front of a [`Replica`], with peers over TCP.
+//! server (D30) in front of one [`Replica`] per partition (M8, D74, D75), with
+//! peers over TCP.
 //!
 //! ```text
-//! clients ──(op, reply)──┐
-//!                        ├─> core channel ──> core thread: Replica (node, log, queue)
-//! peers' connections ────┘   (Input)            drains requests into one entry (D66),
-//!   (Raft messages in)                          heartbeats and elections on timers
-//!                                                    │
-//! dial tasks, one per peer  <──(Raft messages out)───┘
+//! clients ──(partition, op)──┐
+//!                            ├─> core channel p ──> core thread p: Replica (node, log, queue)
+//! peers' connections ────────┘   (Input)              drains requests into one entry (D66),
+//!   (partition, Raft message)                         heartbeats and elections on timers
+//!                                                          │
+//! dial tasks, one per peer  <──(partition, Raft message)───┘
 //! ```
 //!
-//! The core thread is the only owner of the replica, as in D30. Everything a
-//! replica learns arrives on one channel: client requests and the Raft
-//! messages its peers send on the connections they dialed. What it sends goes
-//! out on connections it dialed itself, one task per peer, which redial when
-//! a connection breaks. A full outgoing queue drops the message: Raft
-//! resends what matters (D57, D60).
+//! Each core thread is the only owner of its replica, as in D30. Everything a
+//! replica learns arrives on its channel: client requests for its partition
+//! and the Raft messages of its group that peers send on the connections they
+//! dialed. What it sends goes out on connections this node dialed, one task
+//! per peer shared by every partition, which redial when a connection breaks.
+//! A full outgoing queue drops the message: Raft resends what matters (D57,
+//! D60).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -77,16 +79,24 @@ const REDIAL: Duration = Duration::from_millis(100);
 
 pub struct ClusterServer<S: Storage> {
     addr: SocketAddr,
+    partitions: usize,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
-    done: oneshot::Receiver<Stopped<S>>,
+    /// Each core thread's end, with its partition.
+    done: mpsc::UnboundedReceiver<(u16, Stopped<S>)>,
 }
 
+/// A Raft message on its way to a peer, with the partition whose group it
+/// belongs to (D75).
+type Outgoing = (u16, Message);
+
 impl<S: Storage + Send + 'static> ClusterServer<S> {
-    /// Recover the replica from `storage` (D67), start its core thread, dial
-    /// the peers and serve on `listener`. Must run inside a tokio runtime.
+    /// Recover one replica per partition, partition `p` from `storages[p]`
+    /// (D67, D81), start their core threads, dial the peers and serve on
+    /// `listener`. Every node of a cluster must be given the same number of
+    /// partitions. Must run inside a tokio runtime.
     pub async fn start(
-        storage: S,
+        storages: Vec<S>,
         listener: TcpListener,
         options: ClusterOptions,
     ) -> Result<Self, ServerError> {
@@ -97,7 +107,19 @@ impl<S: Storage + Send + 'static> ClusterServer<S> {
                 options.id
             )));
         }
-        let (replica, _) = Replica::open(options.id, &ids, storage, options.check)?;
+        if storages.is_empty() || storages.len() > MAX_PARTITIONS {
+            return Err(ServerError::Invariant(format!(
+                "{} partitions, expected 1 to {MAX_PARTITIONS}",
+                storages.len()
+            )));
+        }
+        let mut replicas = Vec::new();
+        for (p, storage) in storages.into_iter().enumerate() {
+            let partition = p as u16;
+            let (replica, _) = Replica::open(options.id, &ids, partition, storage, options.check)?;
+            replicas.push(replica);
+        }
+        let partitions = replicas.len();
         let addr = listener.local_addr()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -114,24 +136,32 @@ impl<S: Storage + Send + 'static> ClusterServer<S> {
                 )));
             }
         }
-        let (core_tx, core_rx) = mpsc::channel(options.core_queue);
-        let (done_tx, done) = oneshot::channel();
-        let core_options = options.clone();
-        std::thread::Builder::new()
-            .name(format!("spool-core-{}", options.id))
-            .spawn(move || {
-                let stopped = core(replica, core_rx, peers, &core_options);
-                let _ = done_tx.send(stopped);
-            })?;
+        let (done_tx, done) = mpsc::unbounded_channel();
+        let mut cores = Vec::new();
+        for (p, replica) in replicas.into_iter().enumerate() {
+            let partition = p as u16;
+            let (core_tx, core_rx) = mpsc::channel(options.core_queue);
+            cores.push(core_tx);
+            let core_options = options.clone();
+            let peers = peers.clone();
+            let done_tx = done_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("spool-core-{}-p{partition}", options.id))
+                .spawn(move || {
+                    let stopped = core(partition, replica, core_rx, peers, &core_options);
+                    let _ = done_tx.send((partition, stopped));
+                })?;
+        }
         tasks.push(tokio::spawn(accept(
             listener,
-            core_tx,
+            cores,
             options.in_flight,
             true,
             shutdown_rx,
         )));
         Ok(ClusterServer {
             addr,
+            partitions,
             shutdown,
             tasks,
             done,
@@ -142,23 +172,34 @@ impl<S: Storage + Send + 'static> ClusterServer<S> {
         self.addr
     }
 
-    /// Wait until the core thread stops by itself: a log error or (with
-    /// `check`) a broken invariant (D38).
-    pub async fn stopped(&mut self) -> Stopped<S> {
-        (&mut self.done)
+    /// Wait until a core thread stops by itself: a log error or (with
+    /// `check`) a broken invariant (D38). The others keep serving.
+    pub async fn stopped(&mut self) -> (u16, Stopped<S>) {
+        self.done
+            .recv()
             .await
-            .expect("core thread reports how it ended")
+            .expect("core threads report how they ended")
     }
 
-    /// Stop serving and dialing, and wait for the core thread to finish.
-    pub async fn shutdown(self) -> Stopped<S> {
+    /// Stop serving and dialing, and wait for every core thread to finish:
+    /// how each ended, by partition.
+    pub async fn shutdown(mut self) -> Vec<Stopped<S>> {
         let _ = self.shutdown.send(true);
         for task in self.tasks {
             let _ = task.await;
         }
-        self.done.await.expect("core thread reports how it ended")
+        let mut stopped: Vec<(u16, Stopped<S>)> = Vec::new();
+        while stopped.len() < self.partitions {
+            let one = self.done.recv().await;
+            stopped.push(one.expect("core threads report how they ended"));
+        }
+        stopped.sort_by_key(|(p, _)| *p);
+        stopped.into_iter().map(|(_, s)| s).collect()
     }
 }
+
+/// Partitions a cluster may have (D74).
+pub const MAX_PARTITIONS: usize = 256;
 
 /// A reply channel: where the core thread answers a request.
 type Tag = oneshot::Sender<Reply>;
@@ -172,16 +213,17 @@ type Tag = oneshot::Sender<Reply>;
 /// single node's core (D30), this one cannot wait for every pending reply,
 /// since without a quorum some never come.
 fn core<S: Storage>(
+    partition: u16,
     mut replica: Replica<S, Tag>,
     mut rx: mpsc::Receiver<Input>,
-    peers: BTreeMap<Id, mpsc::Sender<Message>>,
+    peers: BTreeMap<Id, mpsc::Sender<Outgoing>>,
     options: &ClusterOptions,
 ) -> Stopped<S> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .expect("a timer runtime");
-    let mut timers = Timers::new(options);
+    let mut timers = Timers::new(options, partition);
     let mut stats = Stats::default();
     let result = (|| -> Result<(), ServerError> {
         let out = replica.start().map_err(failed)?;
@@ -291,6 +333,7 @@ fn failed(e: ReplicaError) -> ServerError {
 /// The core thread's timers and the generator for election timeouts: the
 /// driver's randomness (D59), never the replica's.
 struct Timers {
+    partition: u16,
     heartbeat_at: Instant,
     election_at: Instant,
     election: (Duration, Duration),
@@ -298,25 +341,26 @@ struct Timers {
 }
 
 impl Timers {
-    fn new(options: &ClusterOptions) -> Self {
+    fn new(options: &ClusterOptions, partition: u16) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
         let now = Instant::now();
         Timers {
+            partition,
             heartbeat_at: now + options.heartbeat,
             election_at: now + options.election.1,
             election: options.election,
-            rng: (nanos ^ (u64::from(options.id) << 32)) | 1,
+            rng: (nanos ^ (u64::from(options.id) << 32) ^ (u64::from(partition) << 48)) | 1,
         }
     }
 
     /// Send, answer, and restart the election timer if the replica asks.
-    fn handle(&mut self, out: Output<Tag>, peers: &BTreeMap<Id, mpsc::Sender<Message>>) {
+    fn handle(&mut self, out: Output<Tag>, peers: &BTreeMap<Id, mpsc::Sender<Outgoing>>) {
         for (to, msg) in out.send {
             if let Some(peer) = peers.get(&to) {
                 // Full or closed: the message is lost, as on a network.
-                let _ = peer.try_send(msg);
+                let _ = peer.try_send((self.partition, msg));
             }
         }
         for (reply, r) in out.replies {
@@ -345,7 +389,7 @@ impl Timers {
 async fn dial(
     me: Id,
     addr: SocketAddr,
-    mut rx: mpsc::Receiver<Message>,
+    mut rx: mpsc::Receiver<Outgoing>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut buf = Vec::new();
@@ -363,7 +407,7 @@ async fn dial(
         let _ = stream.set_nodelay(true);
         buf.clear();
         let hello = Request::Peer {
-            version: protocol::VERSION,
+            version: protocol::PEER_VERSION,
             from: me,
         };
         protocol::encode_request(0, &hello, &mut buf);
@@ -379,8 +423,8 @@ async fn dial(
             buf.clear();
             let mut next = Some(msg);
             // Everything already queued goes out in one write.
-            while let Some(m) = next.take().or_else(|| rx.try_recv().ok()) {
-                protocol::encode_request(0, &Request::Raft(m), &mut buf);
+            while let Some((p, m)) = next.take().or_else(|| rx.try_recv().ok()) {
+                protocol::encode_request(0, &Request::Raft(p, m), &mut buf);
             }
             if protocol::write_all(&mut stream, &buf).await.is_err() {
                 break;

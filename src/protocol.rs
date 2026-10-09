@@ -11,7 +11,8 @@
 //! not_leader (0x84) = has_leader:u8 leader:u32   server -> client (version 2, D71)
 //! unknown    (0x85)                              server -> client (version 2, D71)
 //! peer       (3)    = version:u32 from:u32       replica -> replica, first frame
-//! raft       (4)    = message                    replica -> replica, never answered
+//! raft       (4)    = partition:u16 message      replica -> replica, never answered
+//! routed     (5)    = partition:u16 op           client -> server (version 3, D76)
 //!
 //! message       = tag:u8 term:u64 fields
 //! prevote   (1) = last_index:u64 last_term:u64
@@ -31,7 +32,11 @@
 //!
 //! Replies come in request order and echo the request's id. Version 2 adds
 //! the two replies a replicated node sends (D71); servers accept versions 1
-//! and 2, and only a cluster ever sends them. A frame whose
+//! and 2, and only a cluster ever sends them. Version 3 adds `routed`, a
+//! request for one partition of a cluster (D76); a plain `request` is for
+//! partition 0, so a single node is partition 0 of one. The peers of a
+//! cluster speak version 3 only, since `raft` frames name their partition
+//! (D75). A frame whose
 //! `len` is over [`MAX_FRAME`] is refused before anything is allocated for it.
 
 use std::io;
@@ -44,7 +49,9 @@ use crate::command::{Event, Op};
 use crate::raft::{AppendResult, Entry, Message};
 
 /// The newest version; every version from 1 up to it is spoken.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+/// The only version a cluster's peers speak (D75).
+pub const PEER_VERSION: u32 = 3;
 /// Largest `len` accepted: 1 MiB (D32).
 pub const MAX_FRAME: u32 = 1 << 20;
 /// Largest `len` accepted on a connection a peer opened.
@@ -56,6 +63,7 @@ const HELLO: u8 = 1;
 const REQUEST: u8 = 2;
 const PEER: u8 = 3;
 const RAFT: u8 = 4;
+const ROUTED: u8 = 5;
 const HELLO_OK: u8 = 0x81;
 const EVENTS: u8 = 0x82;
 const ERROR: u8 = 0x83;
@@ -73,13 +81,20 @@ pub enum Request {
     Hello {
         version: u32,
     },
+    /// An op for partition 0.
     Op(Op),
+    /// An op for one partition of a cluster (version 3, D76).
+    Routed {
+        partition: u16,
+        op: Op,
+    },
     /// A replica opening a connection to send Raft messages (M7).
     Peer {
         version: u32,
         from: u32,
     },
-    Raft(Message),
+    /// A Raft message for the replica of `partition` (D75).
+    Raft(u16, Message),
 }
 
 /// What the server sends back.
@@ -159,11 +174,18 @@ pub fn encode_request(id: u64, req: &Request, out: &mut Vec<u8>) {
     match req {
         Request::Hello { version } => put_frame(out, HELLO, id, |o| codec::put_u32(o, *version)),
         Request::Op(op) => put_frame(out, REQUEST, id, |o| codec::encode_op(op, o)),
+        Request::Routed { partition, op } => put_frame(out, ROUTED, id, |o| {
+            o.extend_from_slice(&partition.to_le_bytes());
+            codec::encode_op(op, o);
+        }),
         Request::Peer { version, from } => put_frame(out, PEER, id, |o| {
             codec::put_u32(o, *version);
             codec::put_u32(o, *from);
         }),
-        Request::Raft(m) => put_frame(out, RAFT, id, |o| encode_message(m, o)),
+        Request::Raft(partition, m) => put_frame(out, RAFT, id, |o| {
+            o.extend_from_slice(&partition.to_le_bytes());
+            encode_message(m, o);
+        }),
     }
 }
 
@@ -202,6 +224,13 @@ impl Frame {
                 Ok(Request::Hello { version })
             }
             REQUEST => Ok(Request::Op(codec::decode_op(&self.body)?)),
+            ROUTED => {
+                let (partition, rest) = split_partition(&self.body)?;
+                Ok(Request::Routed {
+                    partition,
+                    op: codec::decode_op(rest)?,
+                })
+            }
             PEER => {
                 let mut r = Reader::new(&self.body);
                 let version = r.u32()?;
@@ -209,7 +238,10 @@ impl Frame {
                 r.finish()?;
                 Ok(Request::Peer { version, from })
             }
-            RAFT => Ok(Request::Raft(decode_message(&self.body)?)),
+            RAFT => {
+                let (partition, rest) = split_partition(&self.body)?;
+                Ok(Request::Raft(partition, decode_message(rest)?))
+            }
             kind => Err(FrameError::UnknownKind(kind)),
         }
     }
@@ -241,6 +273,14 @@ impl Frame {
         r.finish()?;
         Ok(reply)
     }
+}
+
+/// The partition a `routed` or `raft` body starts with, and the rest.
+fn split_partition(body: &[u8]) -> Result<(u16, &[u8]), DecodeError> {
+    let (p, rest) = body
+        .split_first_chunk::<2>()
+        .ok_or(DecodeError::Truncated)?;
+    Ok((u16::from_le_bytes(*p), rest))
 }
 
 /// Read one frame. `Ok(None)` is a clean end of stream between frames; an end
@@ -681,11 +721,15 @@ mod tests {
                 },
             },
         ];
-        for m in messages {
+        for (i, m) in messages.into_iter().enumerate() {
+            let partition = [0, 1, 255, u16::MAX][i % 4];
             let mut out = Vec::new();
-            encode_request(0, &Request::Raft(m.clone()), &mut out);
+            encode_request(0, &Request::Raft(partition, m.clone()), &mut out);
             let frame = read_one(&out).unwrap().unwrap();
-            assert_eq!(frame.request().unwrap(), Request::Raft(m.clone()));
+            assert_eq!(
+                frame.request().unwrap(),
+                Request::Raft(partition, m.clone())
+            );
             let mut body = Vec::new();
             encode_message(&m, &mut body);
             for len in 0..body.len() {
@@ -703,6 +747,24 @@ mod tests {
             decode_message(&[9, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(DecodeError::UnknownTag { tag: 9, .. })
         ));
+    }
+
+    #[test]
+    fn routed_requests_name_their_partition() {
+        let op: Op = "@0 lease q 10".parse::<crate::Command>().unwrap().op;
+        for partition in [0, 7, u16::MAX] {
+            let req = Request::Routed {
+                partition,
+                op: op.clone(),
+            };
+            let mut out = Vec::new();
+            encode_request(3, &req, &mut out);
+            assert_eq!(read_one(&out).unwrap().unwrap().request().unwrap(), req);
+        }
+        // A body too short to hold the partition.
+        let mut out = Vec::new();
+        put_frame(&mut out, ROUTED, 1, |o| o.push(0));
+        assert!(read_one(&out).unwrap().unwrap().request().is_err());
     }
 
     #[test]

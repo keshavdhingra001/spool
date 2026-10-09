@@ -78,7 +78,7 @@ async fn handshake_and_protocol_errors() {
         assert!(read(&mut s).await.is_none(), "closed after the error");
     };
     refused(
-        frames(&[(1, Request::Hello { version: 3 })]),
+        frames(&[(1, Request::Hello { version: 4 })]),
         ErrorCode::UnsupportedVersion,
     )
     .await;
@@ -132,6 +132,40 @@ async fn handshake_and_protocol_errors() {
     let stopped = server.shutdown().await;
     stopped.result.unwrap();
     assert_eq!(stopped.stats.commands, 0, "nothing reached the queue");
+}
+
+#[tokio::test]
+async fn a_single_node_is_partition_0_of_one() {
+    let clock = ManualClock::new(1_000);
+    let server = start(MemStorage::new(), &clock).await;
+    let mut s = connect(server.local_addr()).await;
+    let routed = |partition, line| Request::Routed {
+        partition,
+        op: op(line),
+    };
+    s.write_all(&frames(&[(1, routed(0, "enqueue q a"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        events(read(&mut s).await.unwrap()),
+        ["enqueued job=1 queue=q ready_at=1000"]
+    );
+    // There is no partition 1: the connection is refused, as for any frame
+    // the server cannot serve.
+    s.write_all(&frames(&[(2, routed(1, "lease q 10"))]))
+        .await
+        .unwrap();
+    let f = read(&mut s).await.unwrap();
+    assert_eq!(f.id, 2);
+    match f.reply().unwrap() {
+        Reply::Error { code, message } => {
+            assert_eq!(code, ErrorCode::Protocol);
+            assert!(message.contains("partition 1"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(read(&mut s).await.is_none());
+    server.shutdown().await.result.unwrap();
 }
 
 #[tokio::test]

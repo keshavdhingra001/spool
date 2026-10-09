@@ -185,7 +185,7 @@ impl<S: Storage + Send + 'static> Server<S> {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let accept = tokio::spawn(accept(
             listener,
-            core_tx,
+            vec![core_tx],
             options.in_flight,
             false,
             shutdown_rx,
@@ -332,11 +332,12 @@ fn check<S: Storage>(
     agree(durable.queue().counts(), ledger.counts())
 }
 
-/// Accept connections until shutdown. With `cluster`, a connection may also
-/// be a peer replica's (M7).
+/// Accept connections until shutdown, handing each request to the core
+/// thread of its partition: `cores[p]` (D75). With `cluster`, a connection
+/// may also be a peer replica's (M7).
 pub(crate) async fn accept(
     listener: TcpListener,
-    core: mpsc::Sender<Input>,
+    cores: Vec<mpsc::Sender<Input>>,
     in_flight: usize,
     cluster: bool,
     mut shutdown: watch::Receiver<bool>,
@@ -350,7 +351,7 @@ pub(crate) async fn accept(
                     let _ = stream.set_nodelay(true);
                     connections.spawn(connection(
                         stream,
-                        core.clone(),
+                        cores.clone(),
                         in_flight,
                         cluster,
                         shutdown.clone(),
@@ -363,7 +364,7 @@ pub(crate) async fn accept(
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
-    drop(core);
+    drop(cores);
     while connections.join_next().await.is_some() {}
 }
 
@@ -383,7 +384,7 @@ enum Greeted {
 
 async fn connection(
     stream: TcpStream,
-    core: mpsc::Sender<Input>,
+    cores: Vec<mpsc::Sender<Input>>,
     in_flight: usize,
     cluster: bool,
     mut shutdown: watch::Receiver<bool>,
@@ -428,7 +429,7 @@ async fn connection(
                     Greeted::No
                 }
             }
-            Ok(Request::Peer { version, from }) if cluster && protocol::speaks(version) => {
+            Ok(Request::Peer { version, from }) if cluster && version == protocol::PEER_VERSION => {
                 Greeted::Peer(from)
             }
             Ok(Request::Hello { version }) => {
@@ -470,11 +471,11 @@ async fn connection(
     };
 
     match greeted {
-        Greeted::Client => requests(&mut rd, &pending, &core, &mut shutdown).await,
-        Greeted::Peer(from) => peer(&mut rd, from, &core, &mut shutdown).await,
+        Greeted::Client => requests(&mut rd, &pending, &cores, &mut shutdown).await,
+        Greeted::Peer(from) => peer(&mut rd, from, &cores, &mut shutdown).await,
         Greeted::No => {}
     }
-    drop(core);
+    drop(cores);
     drop(pending);
     let _ = writer.await;
 }
@@ -484,7 +485,7 @@ async fn connection(
 async fn requests(
     rd: &mut tokio::net::tcp::OwnedReadHalf,
     pending: &mpsc::Sender<Pending>,
-    core: &mpsc::Sender<Input>,
+    cores: &[mpsc::Sender<Input>],
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let error = |id, code, message: String| Pending::Now(id, Reply::Error { code, message });
@@ -501,8 +502,9 @@ async fn requests(
                 break;
             }
         };
-        let op = match frame.request() {
-            Ok(Request::Op(op)) => op,
+        let (partition, op) = match frame.request() {
+            Ok(Request::Op(op)) => (0, op),
+            Ok(Request::Routed { partition, op }) => (partition, op),
             Ok(_) => {
                 let message = "only requests after the hello".to_string();
                 let _ = pending
@@ -516,6 +518,13 @@ async fn requests(
                     .await;
                 break;
             }
+        };
+        let Some(core) = cores.get(usize::from(partition)) else {
+            let message = format!("partition {partition}, but this server has {}", cores.len());
+            let _ = pending
+                .send(error(frame.id, ErrorCode::Protocol, message))
+                .await;
+            break;
         };
         // Take an in-flight slot first, then a place in the core channel:
         // either wait is the backpressure of D37.
@@ -536,7 +545,7 @@ async fn requests(
 async fn peer(
     rd: &mut tokio::net::tcp::OwnedReadHalf,
     from: raft::Id,
-    core: &mpsc::Sender<Input>,
+    cores: &[mpsc::Sender<Input>],
     shutdown: &mut watch::Receiver<bool>,
 ) {
     loop {
@@ -545,7 +554,10 @@ async fn peer(
             f = protocol::read_frame_max(rd, protocol::MAX_PEER_FRAME) => f,
         };
         let Ok(Some(frame)) = frame else { break };
-        let Ok(Request::Raft(msg)) = frame.request() else {
+        let Ok(Request::Raft(partition, msg)) = frame.request() else {
+            break;
+        };
+        let Some(core) = cores.get(usize::from(partition)) else {
             break;
         };
         if core.send(Input::Raft(from, msg)).await.is_err() {

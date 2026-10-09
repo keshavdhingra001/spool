@@ -395,7 +395,7 @@ impl Process<Msg> for Server {
         let members = self.ck.borrow().members.clone();
         self.ck.borrow_mut().applied.insert(self.id, 0);
         self.ck.borrow_mut().leading.remove(&self.id);
-        match Replica::open(self.id, &members, self.disk.clone(), true) {
+        match Replica::open(self.id, &members, 0, self.disk.clone(), true) {
             Ok((replica, opened)) => {
                 let mut sh = self.sh.borrow_mut();
                 sh.cov.recoveries += u64::from(opened.records > 0);

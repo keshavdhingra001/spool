@@ -116,12 +116,14 @@ pub struct Replica<S: Storage, T> {
 }
 
 impl<S: Storage, T> Replica<S, T> {
-    /// Recover replica `id` of the cluster `members` from `storage`. Its queue
-    /// starts empty and is rebuilt as entries are learned to be committed
-    /// (D67). The first output asks for an election timer.
+    /// Recover replica `id` of `partition`'s group `members` from `storage`.
+    /// Its queue starts empty and is rebuilt as entries are learned to be
+    /// committed (D67); its job ids carry the partition (D77). The first
+    /// output asks for an election timer.
     pub fn open(
         id: Id,
         members: &[Id],
+        partition: u16,
         storage: S,
         check: bool,
     ) -> Result<(Self, Opened), StoreError> {
@@ -129,8 +131,8 @@ impl<S: Storage, T> Replica<S, T> {
         let replica = Replica {
             node: Node::new(id, members, saved),
             log,
-            queue: ReferenceQueue::new(),
-            ledger: check.then(Ledger::new),
+            queue: ReferenceQueue::for_partition(partition),
+            ledger: check.then(|| Ledger::for_partition(partition)),
             applied: 0,
             pending: BTreeMap::new(),
             bug: None,
@@ -373,7 +375,7 @@ mod tests {
             let members = [0, 1, 2];
             let replicas = members
                 .iter()
-                .map(|&id| R::open(id, &members, MemStorage::new(), true).unwrap().0)
+                .map(|&id| R::open(id, &members, 0, MemStorage::new(), true).unwrap().0)
                 .collect();
             Cluster {
                 replicas,
@@ -492,7 +494,7 @@ mod tests {
             let mut c = Cluster::new();
             for r in &mut c.replicas {
                 let r2 =
-                    std::mem::replace(r, R::open(9, &[9], MemStorage::new(), false).unwrap().0);
+                    std::mem::replace(r, R::open(9, &[9], 0, MemStorage::new(), false).unwrap().0);
                 *r = r2.with_bugs(None, bug);
             }
             c.elect(0);
@@ -551,7 +553,7 @@ mod tests {
     #[test]
     fn reply_before_commit_answers_from_the_leaders_own_log() {
         let mut c = Cluster::new();
-        c.replicas[0] = R::open(0, &[0, 1, 2], MemStorage::new(), true)
+        c.replicas[0] = R::open(0, &[0, 1, 2], 0, MemStorage::new(), true)
             .unwrap()
             .0
             .with_bugs(None, Some(Bug::ReplyBeforeCommit));
@@ -576,7 +578,7 @@ mod tests {
         let disk = c.replicas[2].storage().clone();
         let mut before = Vec::new();
         c.replicas[2].queue().encode_state(&mut before);
-        let (mut r, opened) = R::open(2, &[0, 1, 2], disk, true).unwrap();
+        let (mut r, opened) = R::open(2, &[0, 1, 2], 0, disk, true).unwrap();
         assert!(opened.records > 0);
         assert_eq!(
             r.queue().counts().total(),

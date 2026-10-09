@@ -1631,7 +1631,7 @@ mod tests {
         fn a() -> (QueueName, OrderKey) {
             (QueueName::new("q").unwrap(), OrderKey::new("a").unwrap())
         }
-        let corruptions: [(&str, Corrupt); 6] = [
+        let corruptions: [(&str, Corrupt); 7] = [
             ("blocked job leasable", |q| {
                 let id = JobId::new(5, 1);
                 let qs = q.queues.get_mut(&QueueName::new("q").unwrap()).unwrap();
@@ -1653,6 +1653,12 @@ mod tests {
             }),
             ("group without its queue", |q| {
                 q.queues.remove(&QueueName::new("q:g").unwrap());
+            }),
+            ("result of another partition's job", |q| {
+                let job = JobId::new(6, 1);
+                q.results
+                    .insert(job, (Token(1), Payload(Vec::new()), Time(1_000)));
+                q.results_expiry.insert((Time(1_000), job));
             }),
         ];
         ordered().check_invariants().unwrap();

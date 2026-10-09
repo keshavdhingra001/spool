@@ -70,6 +70,7 @@ mod tests {
     #[test]
     fn the_ordering_key_wins_over_the_dedup_key() {
         let by_order = route(&op("enqueue q x order=user-1"), 7);
+        assert_eq!(by_order, Route::One((fnv1a(b"user-1") % 7) as u16));
         assert_eq!(route(&op("enqueue q x key=k1 order=user-1"), 7), by_order);
         assert_eq!(route(&op("enqueue q y key=k2 order=user-1"), 7), by_order);
         assert_eq!(

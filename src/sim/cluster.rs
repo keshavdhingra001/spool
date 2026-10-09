@@ -984,6 +984,8 @@ fn check_end(world: &World<Msg>, sh: &Sh, ck_cell: &Ck, options: &Options) -> Re
 /// redriven one rejoins it at the back.
 #[derive(Default)]
 struct OrderCheck {
+    /// The partition each ordering key was seen in: only one (D76).
+    partition_of: BTreeMap<(QueueName, OrderKey), u16>,
     key_of: BTreeMap<JobId, (QueueName, OrderKey)>,
     /// Per key, the jobs not yet finished, oldest first.
     waiting: BTreeMap<(QueueName, OrderKey), VecDeque<JobId>>,
@@ -1004,6 +1006,18 @@ impl OrderCheck {
                     ..
                 } => {
                     let k = (queue.clone(), order.clone());
+                    let p = *self
+                        .partition_of
+                        .entry(k.clone())
+                        .or_insert(job.partition());
+                    if p != job.partition() {
+                        return Err(format!(
+                            "ordering key {}/{} has jobs in partitions {p} and {}",
+                            k.0,
+                            k.1,
+                            job.partition()
+                        ));
+                    }
                     self.key_of.insert(*job, k.clone());
                     self.waiting.entry(k).or_default().push_back(*job);
                 }

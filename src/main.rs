@@ -99,8 +99,11 @@ usage: spool                                   REPL, in memory
        spool sim --raft ...                    the same on the Raft world (M6); bugs (D64):
                                                vote-not-persisted, commit-old-term,
                                                no-log-truncate, stale-term-accept
-       spool sim --cluster ...                 the queue on Raft (M7); bugs: the queue's and
-                                               reply-before-commit, ignore-term-on-reply (D73)";
+       spool sim --cluster ... [--partitions <p>] [--no-checks]
+                                               the queue on Raft (M7), partitioned (M8); bugs:
+                                               the queue's, reply-before-commit,
+                                               ignore-term-on-reply (D73), wrong-partition,
+                                               ignore-order-key (D82)";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -116,6 +119,8 @@ fn sim(args: &[&str]) -> ! {
     let mut on_raft = false;
     let mut on_cluster = false;
     let mut bug: Option<&str> = None;
+    let mut partitions: Option<u16> = None;
+    let mut checks = true;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
         match (arg, it.clone().next()) {
@@ -138,6 +143,11 @@ fn sim(args: &[&str]) -> ! {
                 bug = Some(name);
                 it.next();
             }
+            ("--partitions", Some(n)) => {
+                partitions = Some(n.parse().unwrap_or_else(|_| usage()));
+                it.next();
+            }
+            ("--no-checks", _) => checks = false,
             _ => usage(),
         }
     }
@@ -192,12 +202,16 @@ fn sim(args: &[&str]) -> ! {
     if on_cluster {
         use spool::replica::Bug;
         let mut options = cluster::Options::new(0);
+        options.partitions = partitions;
+        options.checks = checks;
         match bug {
             None => {}
             Some("no-fence") => options.queue_bug = Some(queue::Bug::NoFence),
             Some("no-dedup-key") => options.queue_bug = Some(queue::Bug::NoDedupKey),
+            Some("wrong-partition") => options.queue_bug = Some(queue::Bug::WrongPartition),
             Some("reply-before-commit") => options.bug = Some(Bug::ReplyBeforeCommit),
             Some("ignore-term-on-reply") => options.bug = Some(Bug::IgnoreTermOnReply),
+            Some("ignore-order-key") => options.bug = Some(Bug::IgnoreOrderKey),
             Some(_) => usage(),
         }
         let mut total = cluster::Coverage::default();

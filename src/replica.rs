@@ -51,6 +51,9 @@ pub enum Bug {
     /// The leader answers with whatever entry applied at the proposal's index,
     /// whatever its term.
     IgnoreTermOnReply,
+    /// The queue leases any waiting job, first of its ordering key or not
+    /// (D82): every replica alike, so they still agree with each other.
+    IgnoreOrderKey,
 }
 
 /// What the driver must do after an input: send, deliver the replies, and
@@ -143,6 +146,9 @@ impl<S: Storage, T> Replica<S, T> {
     pub fn with_bugs(mut self, raft: Option<raft::Bug>, replica: Option<Bug>) -> Self {
         self.node.set_bug(raft);
         self.bug = replica;
+        if replica == Some(Bug::IgnoreOrderKey) {
+            self.queue.plant_ignore_order();
+        }
         self
     }
 

@@ -27,9 +27,10 @@ use crate::queue::{Queue, Snapshot};
 use crate::raft;
 use crate::reference::{Counts, ReferenceQueue};
 use crate::retry::QueueConfig;
+use crate::route::{Route, route};
 use crate::server::{Core, ServerError};
 use crate::storage::MemStorage;
-use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Time, Token};
+use crate::types::{DedupKey, JobId, Lease, Millis, OrderKey, Payload, QueueName, Time, Token};
 
 /// Lease length the workers ask for.
 pub const VISIBILITY: Millis = Millis(1_000);
@@ -52,6 +53,9 @@ pub enum Bug {
     NoFence,
     /// Producers enqueue without a dedup key, so a retry adds a second job.
     NoDedupKey,
+    /// A producer resends an enqueue to another partition than the first
+    /// try (D82), where its dedup key is unknown.
+    WrongPartition,
 }
 
 #[derive(Clone, Debug)]
@@ -279,8 +283,8 @@ pub enum Msg {
     },
     /// The store's answer: `ok` is false when the fence refused the write.
     Written { req: u64, ok: bool },
-    /// Between the replicas of a replicated queue (M7).
-    Raft(raft::Message),
+    /// Between the replicas of one partition's group (M7, D75).
+    Raft(u16, raft::Message),
 }
 
 impl Message for Msg {
@@ -301,7 +305,7 @@ impl Message for Msg {
             Msg::Written { req, ok } => {
                 super::digest(&[&req.to_le_bytes()[..], &[*ok as u8]].concat())
             }
-            Msg::Raft(m) => super::digest_of(m),
+            Msg::Raft(p, m) => super::fnv(super::digest_of(m), &p.to_le_bytes()),
         }
     }
 }
@@ -334,7 +338,10 @@ impl fmt::Debug for Msg {
                 value,
             } => write!(f, "#{req} write job={job} token={token} value={value}"),
             Msg::Written { req, ok } => write!(f, "#{req} -> written ok={ok}"),
-            Msg::Raft(m) => super::raft::fmt_raft(m, f, batch_text),
+            Msg::Raft(p, m) => {
+                write!(f, "p{p} ")?;
+                super::raft::fmt_raft(m, f, batch_text)
+            }
         }
     }
 }
@@ -376,8 +383,15 @@ pub(super) struct Shared {
     pub(super) replied: u64,
     /// The queue's counts after the last batch.
     pub(super) counts: Counts,
-    /// The job id each producer key got.
+    /// The job id each producer key got: with consumer groups, the first
+    /// group's (D80).
     pub(super) keys: BTreeMap<String, JobId>,
+    /// Jobs the producers' keys made: one per key, or one per consumer group.
+    pub(super) expected: u64,
+    /// Partitions of the queue (M8): 1 for a single server.
+    pub(super) partitions: u16,
+    /// The queues workers lease from, in turn.
+    pub(super) queues: Vec<QueueName>,
     pub(super) producers_done: BTreeSet<u32>,
     pub(super) fence: FencedStore<JobId, Payload>,
     /// The store's contents: what the fence let through.
@@ -401,6 +415,9 @@ impl Shared {
             replied: 0,
             counts: Counts::default(),
             keys: BTreeMap::new(),
+            expected: 0,
+            partitions: 1,
+            queues: vec![queue_name()],
             producers_done: BTreeSet::new(),
             fence: FencedStore::new(),
             values: BTreeMap::new(),
@@ -424,9 +441,25 @@ pub(super) fn queue_name() -> QueueName {
     QueueName::new("jobs").unwrap()
 }
 
-fn frame(id: u64, op: Op) -> Msg {
+/// The queue of the producer that fans out to consumer groups (D80).
+pub(super) fn fan_name() -> QueueName {
+    QueueName::new("fan").unwrap()
+}
+
+/// The consumer groups of [`fan_name`].
+pub(super) fn fan_groups() -> [QueueName; 2] {
+    [QueueName::new("g1").unwrap(), QueueName::new("g2").unwrap()]
+}
+
+/// A request for `partition`: plain for partition 0, as a single server
+/// expects, routed otherwise (D76).
+fn frame(id: u64, partition: u16, op: Op) -> Msg {
+    let req = match partition {
+        0 => Request::Op(op),
+        partition => Request::Routed { partition, op },
+    };
     let mut bytes = Vec::new();
-    protocol::encode_request(id, &Request::Op(op), &mut bytes);
+    protocol::encode_request(id, &req, &mut bytes);
     Msg::Frame(bytes)
 }
 
@@ -454,37 +487,44 @@ fn answer(msg: &Msg) -> Option<(u64, Answer)> {
     Some((frame.id, answer))
 }
 
-/// Which server a client sends to, and how it moves on (D71): to a named
-/// leader at once, otherwise to the next server.
-#[derive(Clone, Copy, Debug, Default)]
-struct Route {
-    target: u32,
+/// Which server a client sends each partition's requests to, and how it
+/// moves on (D71): to a named leader at once, otherwise to the next server.
+#[derive(Clone, Debug)]
+struct Routes {
+    targets: Vec<u32>,
 }
 
-impl Route {
-    fn server(&self, sh: &Shared) -> NodeId {
-        sh.servers[self.target as usize]
+impl Routes {
+    fn new(sh: &Shared) -> Self {
+        Routes {
+            targets: vec![0; usize::from(sh.partitions)],
+        }
     }
 
-    fn next(&mut self, sh: &Shared) {
-        self.target = (self.target + 1) % sh.servers.len() as u32;
+    fn server(&self, sh: &Shared, p: u16) -> NodeId {
+        sh.servers[self.targets[usize::from(p)] as usize]
     }
 
-    /// Follow a non-event answer. True if the request should be resent now:
-    /// to a named leader, or after `unknown`. Without a known leader the
-    /// client moves on and waits for its timeout, so a cluster with no leader
-    /// is not flooded.
-    fn follow(&mut self, sh: &mut Shared, answer: &Answer) -> bool {
+    fn next(&mut self, sh: &Shared, p: u16) {
+        let t = &mut self.targets[usize::from(p)];
+        *t = (*t + 1) % sh.servers.len() as u32;
+    }
+
+    /// Follow a non-event answer about partition `p`. True if the request
+    /// should be resent now: to a named leader, or after `unknown`. Without
+    /// a known leader the client moves on and waits for its timeout, so a
+    /// cluster with no leader is not flooded.
+    fn follow(&mut self, sh: &mut Shared, p: u16, answer: &Answer) -> bool {
         match *answer {
             Answer::Events(_) => false,
-            Answer::NotLeader(Some(l)) if l != self.target => {
+            Answer::NotLeader(Some(l)) if l != self.targets[usize::from(p)] => {
                 sh.cov.redirects += 1;
-                self.target = l;
+                self.targets[usize::from(p)] = l;
                 true
             }
             Answer::NotLeader(_) => {
                 sh.cov.not_leader += 1;
-                self.next(sh);
+                self.next(sh, p);
                 false
             }
             Answer::Unknown => {
@@ -697,65 +737,142 @@ impl Process<Msg> for Store {
 
 // ---------------------------------------------------------------- producer
 
-/// Configures the queue, then enqueues its jobs one at a time, each with a
+/// What a producer enqueues (M8, D82).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// Jobs with a dedup key only.
+    Plain,
+    /// Jobs with an ordering key too, two keys taking turns (D79).
+    Ordered,
+    /// Jobs to a queue with two consumer groups (D80).
+    Fan,
+}
+
+/// Sets its queues up, then enqueues its jobs one at a time, each with a
 /// dedup key (D35), resending until it has the job id, with a pause of up to
 /// 3 s between jobs so the work spans the fault phase. After a crash it starts
-/// over from the first job: the keys make that safe.
+/// over from the first step: the keys make that safe. Every setting goes to
+/// every partition (D76), one at a time.
 pub(super) struct Producer {
     sh: Sh,
     index: u32,
     jobs: u64,
-    route: Route,
-    /// 0: configure; `1..=jobs`: enqueue job `next`.
-    next: u64,
+    kind: Kind,
+    routes: Routes,
+    /// Ops before the first job, each with its partition.
+    setup: Vec<(u16, Op)>,
+    /// `0..setup.len()`: a setup op; then job `next - setup.len() + 1`.
+    next: usize,
+    /// Sends of the current step so far, after the first.
+    resends: u32,
+    /// The partition the request in flight went to.
+    partition: u16,
     /// The request waiting for its reply, 0 between jobs.
     req: u64,
     gap_timer: u64,
 }
 
 impl Producer {
+    fn job(&self) -> u64 {
+        (self.next - self.setup.len()) as u64 + 1
+    }
+
     fn key(&self) -> String {
-        format!("p{}-{}", self.index, self.next)
+        format!("p{}-{}", self.index, self.job())
+    }
+
+    fn done(&self) -> bool {
+        self.next >= self.setup.len() + self.jobs as usize
     }
 
     fn send(&mut self, ctx: &mut Ctx<'_, Msg>) {
         let mut sh = self.sh.borrow_mut();
         self.req = sh.req();
-        let op = if self.next == 0 {
-            Op::Configure {
-                queue: queue_name(),
-                config: QueueConfig {
-                    max_attempts: 1_000,
-                    backoff_base: Millis(10),
-                    backoff_cap: Millis(100),
-                },
-            }
+        let (partition, op) = if self.next < self.setup.len() {
+            self.setup[self.next].clone()
         } else {
             let key = self.key();
-            Op::Enqueue {
-                queue: queue_name(),
+            let op = Op::Enqueue {
+                queue: if self.kind == Kind::Fan {
+                    fan_name()
+                } else {
+                    queue_name()
+                },
                 payload: Payload(key.clone().into_bytes()),
                 delay: Millis(0),
                 key: (sh.bug != Some(Bug::NoDedupKey)).then(|| DedupKey::new(&key).unwrap()),
-                order: None,
-            }
+                order: (self.kind == Kind::Ordered).then(|| {
+                    OrderKey::new(&format!("p{}-o{}", self.index, self.job() % 2)).unwrap()
+                }),
+            };
+            let p = match route(&op, sh.partitions) {
+                Route::One(p) => p,
+                Route::Rotate | Route::All => (self.job() % u64::from(sh.partitions)) as u16,
+            };
+            let p = if sh.bug == Some(Bug::WrongPartition) {
+                ((u32::from(p) + self.resends) % u32::from(sh.partitions)) as u16
+            } else {
+                p
+            };
+            (p, op)
         };
-        let to = self.route.server(&sh);
+        self.partition = partition;
+        let to = self.routes.server(&sh, partition);
         drop(sh);
-        ctx.send(to, frame(self.req, op));
+        ctx.send(to, frame(self.req, partition, op));
         ctx.set_timer(TIMEOUT, self.req);
     }
 
-    pub(super) fn new(sh: Sh, index: u32, jobs: u64) -> Self {
+    pub(super) fn new(sh: Sh, index: u32, jobs: u64, kind: Kind) -> Self {
+        let (routes, partitions) = {
+            let s = sh.borrow();
+            (Routes::new(&s), s.partitions)
+        };
+        let config = QueueConfig {
+            max_attempts: 1_000,
+            backoff_base: Millis(10),
+            backoff_cap: Millis(100),
+        };
+        let ops = match kind {
+            Kind::Plain | Kind::Ordered => vec![Op::Configure {
+                queue: queue_name(),
+                config,
+            }],
+            Kind::Fan => {
+                let groups = fan_groups();
+                let subscribe = groups.iter().map(|g| Op::Subscribe {
+                    queue: fan_name(),
+                    group: g.clone(),
+                });
+                let configure = groups.iter().map(|g| Op::Configure {
+                    queue: fan_name().group(g).unwrap(),
+                    config,
+                });
+                subscribe.chain(configure).collect()
+            }
+        };
+        let setup = ops
+            .into_iter()
+            .flat_map(|op| (0..partitions).map(move |p| (p, op.clone())))
+            .collect();
         Producer {
             sh,
             index,
             jobs,
-            route: Route::default(),
+            kind,
+            routes,
+            setup,
             next: 0,
+            resends: 0,
+            partition: 0,
             req: 0,
             gap_timer: 0,
         }
+    }
+
+    fn resend(&mut self, ctx: &mut Ctx<'_, Msg>) {
+        self.resends += 1;
+        self.send(ctx);
     }
 }
 
@@ -768,35 +885,49 @@ impl Process<Msg> for Producer {
         let Some((id, answer)) = answer(&msg) else {
             return;
         };
-        if id != self.req || self.next > self.jobs {
+        if id != self.req || self.done() {
             return;
         }
         let mut sh = self.sh.borrow_mut();
         let Answer::Events(events) = answer else {
-            if self.route.follow(&mut sh, &answer) {
+            if self.routes.follow(&mut sh, self.partition, &answer) {
                 drop(sh);
-                self.send(ctx);
+                self.resend(ctx);
             }
             return;
         };
+        let setup = self.next < self.setup.len();
         for e in &events {
             match e {
-                Event::Configured { .. } if self.next == 0 => self.next = 1,
-                Event::Enqueued { job, .. } | Event::Deduplicated { job, .. } if self.next > 0 => {
+                Event::Configured { .. } | Event::Subscribed { .. } if setup => {}
+                Event::Enqueued { job, .. } | Event::Deduplicated { job, .. } if !setup => {
                     sh.cov.deduplicated += u64::from(matches!(e, Event::Deduplicated { .. }));
                     let key = self.key();
-                    let first = *sh.keys.entry(key.clone()).or_insert(*job);
-                    if first != *job {
-                        sh.fail(format!("key {key} got job {first} and then job {job}"));
+                    match sh.keys.get(&key) {
+                        Some(first) if first != job => {
+                            let first = *first;
+                            sh.fail(format!("key {key} got job {first} and then job {job}"));
+                        }
+                        Some(_) => {}
+                        None => {
+                            sh.keys.insert(key, *job);
+                            sh.expected += if self.kind == Kind::Fan { 2 } else { 1 };
+                        }
                     }
-                    self.next += 1;
                 }
                 _ => continue,
             }
+            self.next += 1;
+            self.resends = 0;
             self.req = 0;
-            if self.next > self.jobs {
+            if self.done() {
                 sh.producers_done.insert(self.index);
                 return;
+            }
+            if self.next < self.setup.len() {
+                // Setup ops go one after another, without a pause.
+                drop(sh);
+                return self.send(ctx);
             }
             self.gap_timer = sh.req();
             drop(sh);
@@ -811,9 +942,9 @@ impl Process<Msg> for Producer {
         } else if id == self.req && self.req != 0 {
             let mut sh = self.sh.borrow_mut();
             sh.cov.enqueue_retries += 1;
-            self.route.next(&sh);
+            self.routes.next(&sh, self.partition);
             drop(sh);
-            self.send(ctx);
+            self.resend(ctx);
         }
     }
 }
@@ -840,7 +971,12 @@ enum Doing {
 /// expects, so timers and replies left over from an abandoned job do nothing.
 pub(super) struct Worker {
     sh: Sh,
-    route: Route,
+    routes: Routes,
+    /// Which queue and partition the next lease asks (D78): queue
+    /// `turn % queues`, partition `turn / queues % partitions`.
+    turn: usize,
+    /// The partition of the request in flight.
+    partition: u16,
     doing: Doing,
     /// The request the worker waits on: lease, write or complete.
     req: u64,
@@ -856,9 +992,12 @@ impl Worker {
     }
 
     pub(super) fn new(sh: Sh) -> Self {
+        let routes = Routes::new(&sh.borrow());
         Worker {
             sh,
-            route: Route::default(),
+            routes,
+            turn: 0,
+            partition: 0,
             doing: Doing::Idle,
             req: 0,
             heartbeat: 0,
@@ -868,13 +1007,14 @@ impl Worker {
         }
     }
 
-    fn server(&self) -> NodeId {
-        self.route.server(&self.sh.borrow())
+    fn server(&self, p: u16) -> NodeId {
+        self.routes.server(&self.sh.borrow(), p)
     }
 
-    fn request(&mut self, ctx: &mut Ctx<'_, Msg>, op: Op) {
+    fn request(&mut self, ctx: &mut Ctx<'_, Msg>, p: u16, op: Op) {
         self.req = self.id();
-        ctx.send(self.server(), frame(self.req, op));
+        self.partition = p;
+        ctx.send(self.server(p), frame(self.req, p, op));
         ctx.set_timer(TIMEOUT, self.req);
     }
 
@@ -903,13 +1043,17 @@ impl Worker {
     fn poll(&mut self, ctx: &mut Ctx<'_, Msg>) {
         self.doing = Doing::Leasing;
         self.heartbeat = 0;
-        self.request(
-            ctx,
-            Op::Lease {
-                queue: queue_name(),
-                visibility: VISIBILITY,
-            },
-        );
+        let (queue, p) = {
+            let sh = self.sh.borrow();
+            let n = sh.queues.len();
+            let p = (self.turn / n % usize::from(sh.partitions)) as u16;
+            (sh.queues[self.turn % n].clone(), p)
+        };
+        let op = Op::Lease {
+            queue,
+            visibility: VISIBILITY,
+        };
+        self.request(ctx, p, op);
     }
 
     fn idle(&mut self, ctx: &mut Ctx<'_, Msg>) {
@@ -938,7 +1082,7 @@ impl Worker {
             token: lease.token,
             result: effect(&lease),
         };
-        self.request(ctx, op);
+        self.request(ctx, lease.job.partition(), op);
     }
 
     fn on_reply(&mut self, ctx: &mut Ctx<'_, Msg>, events: &[Event]) {
@@ -947,6 +1091,7 @@ impl Worker {
                 for e in events {
                     match e {
                         Event::Leased { lease, .. } => {
+                            self.turn += 1;
                             self.doing = Doing::Working(*lease);
                             // Mostly short jobs; some outlive a lease and
                             // need their heartbeats.
@@ -961,7 +1106,10 @@ impl Worker {
                             ctx.set_timer(Millis(VISIBILITY.0 / 3), self.heartbeat_timer);
                             return;
                         }
-                        Event::Empty { .. } => return self.idle(ctx),
+                        Event::Empty { .. } => {
+                            self.turn += 1;
+                            return self.idle(ctx);
+                        }
                         _ => {}
                     }
                 }
@@ -1025,7 +1173,12 @@ impl Process<Msg> for Worker {
         let Answer::Events(events) = answer else {
             let mine = id == self.req || (id == self.heartbeat && self.heartbeat != 0);
             if mine {
-                let now = self.route.follow(&mut self.sh.borrow_mut(), &answer);
+                let p = match self.doing {
+                    _ if id == self.req => self.partition,
+                    Doing::Working(lease) | Doing::Writing(lease) => lease.job.partition(),
+                    _ => self.partition,
+                };
+                let now = self.routes.follow(&mut self.sh.borrow_mut(), p, &answer);
                 // A heartbeat is not resent: the next one goes to the new target.
                 if now && id == self.req {
                     self.resend(ctx);
@@ -1057,7 +1210,8 @@ impl Process<Msg> for Worker {
                 token: lease.token,
                 visibility: VISIBILITY,
             };
-            ctx.send(self.server(), frame(self.heartbeat, op));
+            let p = lease.job.partition();
+            ctx.send(self.server(p), frame(self.heartbeat, p, op));
             self.heartbeat_timer = self.id();
             ctx.set_timer(Millis(VISIBILITY.0 / 3), self.heartbeat_timer);
         } else if id == self.req {
@@ -1065,10 +1219,10 @@ impl Process<Msg> for Worker {
             // node) and resend.
             if !matches!(self.doing, Doing::Writing(_)) {
                 let sh = self.sh.borrow();
-                let mut route = self.route;
-                route.next(&sh);
+                let mut routes = self.routes.clone();
+                routes.next(&sh, self.partition);
                 drop(sh);
-                self.route = route;
+                self.routes = routes;
             }
             self.resend(ctx);
         }
@@ -1106,7 +1260,7 @@ pub fn run(options: &Options) -> Result<Report, Failure> {
     for index in 0..options.producers {
         let (s, jobs) = (sh.clone(), options.jobs);
         clients.push(world.add(Box::new(move |_, _| {
-            Box::new(Producer::new(s.clone(), index, jobs))
+            Box::new(Producer::new(s.clone(), index, jobs, Kind::Plain))
         })));
     }
     for _ in 0..options.workers {
@@ -1266,42 +1420,53 @@ fn check_end(world: &World<Msg>, sh: &Sh) -> Result<(), String> {
     let options = DurableOptions { snapshot_every: 0 };
     let (durable, _) = Durable::<MemStorage>::open(MemStorage::from_files(files), options)
         .map_err(|e| format!("final recovery failed: {e}"))?;
-    check_final(durable.queue(), &sh.borrow())
+    check_final(&[durable.queue()], &sh.borrow())
 }
 
-/// The end state of D53: an empty queue, one completed job per key, each
-/// job's result equal to the store's value by the completing token, and the
-/// store's tokens per job never going back.
-pub(super) fn check_final(q: &ReferenceQueue, s: &Shared) -> Result<(), String> {
-    let c = q.counts();
+/// The end state of D53, over every partition's queue: empty queues, one
+/// completed job per key (one per consumer group for a fan-out key, D80),
+/// each job's result equal to the store's value by the completing token, and
+/// the store's tokens per job never going back.
+pub(super) fn check_final(queues: &[&ReferenceQueue], s: &Shared) -> Result<(), String> {
+    let mut c = Counts::default();
+    let mut results: BTreeMap<JobId, (Token, Payload)> = BTreeMap::new();
+    for q in queues {
+        let qc = q.counts();
+        c.waiting += qc.waiting;
+        c.leased += qc.leased;
+        c.dead += qc.dead;
+        c.acked += qc.acked;
+        results.extend(
+            q.results()
+                .into_iter()
+                .map(|(job, token, payload, _)| (job, (token, payload))),
+        );
+    }
     if c.waiting + c.leased + c.dead != 0 {
         return Err(format!("jobs left in the queue: {c:?}"));
     }
-    let jobs: BTreeSet<JobId> = s.keys.values().copied().collect();
-    if c.acked != jobs.len() as u64 {
-        let why = if c.acked > jobs.len() as u64 {
+    if c.acked != s.expected {
+        let why = if c.acked > s.expected {
             "a retry added a job"
         } else {
             "a job a producer was told about is gone"
         };
         return Err(format!(
-            "{} jobs completed for {} keys: {why}",
+            "{} jobs completed for {} keys' {} jobs: {why}",
             c.acked,
-            jobs.len()
+            s.keys.len(),
+            s.expected
         ));
     }
-    let results: BTreeMap<JobId, (Token, Payload)> = q
-        .results()
-        .into_iter()
-        .map(|(job, token, payload, _)| (job, (token, payload)))
-        .collect();
-    if results.len() != jobs.len() {
-        return Err(format!("{} results for {} jobs", results.len(), jobs.len()));
+    if results.len() as u64 != s.expected {
+        return Err(format!("{} results for {} jobs", results.len(), s.expected));
     }
-    for job in &jobs {
-        let Some((token, payload)) = results.get(job) else {
+    for job in s.keys.values() {
+        if !results.contains_key(job) {
             return Err(format!("job {job} has no result"));
-        };
+        }
+    }
+    for (job, (token, payload)) in &results {
         match s.values.get(job) {
             Some((t, v)) if t == token && v == payload => {}
             Some((t, _)) => {

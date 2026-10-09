@@ -60,6 +60,63 @@ impl<S: Storage + ?Sized> Storage for &mut S {
     }
 }
 
+/// The files of `inner` whose names start with `prefix`, seen without it:
+/// one directory's worth inside another. The simulator keeps each
+/// partition's Raft log on its node's one disk this way (D81), so a crash or
+/// a torn write hits every partition of the node at once, as on a real one.
+#[derive(Clone, Debug)]
+pub struct Prefixed<S> {
+    pub inner: S,
+    pub prefix: String,
+}
+
+impl<S: Storage> Prefixed<S> {
+    fn name(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
+}
+
+impl<S: Storage> Storage for Prefixed<S> {
+    fn list(&self) -> io::Result<Vec<String>> {
+        Ok(self
+            .inner
+            .list()?
+            .into_iter()
+            .filter_map(|n| n.strip_prefix(&self.prefix).map(str::to_string))
+            .collect())
+    }
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.inner.read(&self.name(name))
+    }
+    fn create(&mut self, name: &str) -> io::Result<()> {
+        let name = self.name(name);
+        self.inner.create(&name)
+    }
+    fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        let name = self.name(name);
+        self.inner.append(&name, data)
+    }
+    fn sync(&mut self, name: &str) -> io::Result<()> {
+        let name = self.name(name);
+        self.inner.sync(&name)
+    }
+    fn truncate(&mut self, name: &str, len: u64) -> io::Result<()> {
+        let name = self.name(name);
+        self.inner.truncate(&name, len)
+    }
+    fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
+        let (from, to) = (self.name(from), self.name(to));
+        self.inner.rename(&from, &to)
+    }
+    fn remove(&mut self, name: &str) -> io::Result<()> {
+        let name = self.name(name);
+        self.inner.remove(&name)
+    }
+    fn sync_dir(&mut self) -> io::Result<()> {
+        self.inner.sync_dir()
+    }
+}
+
 /// A real directory, locked against other processes (D29).
 pub struct FileStorage {
     dir: PathBuf,
@@ -394,6 +451,32 @@ mod tests {
             .iter()
             .map(|(n, d)| (n.to_string(), d.to_vec()))
             .collect()
+    }
+
+    #[test]
+    fn prefixed_storage_is_a_directory_inside_another() {
+        let mut disk = MemStorage::new();
+        disk.create("other").unwrap();
+        let mut p1 = Prefixed {
+            inner: &mut disk,
+            prefix: "p1-".into(),
+        };
+        p1.create("log").unwrap();
+        p1.append("log", b"ab").unwrap();
+        p1.sync("log").unwrap();
+        p1.rename("log", "log2").unwrap();
+        p1.sync_dir().unwrap();
+        assert_eq!(p1.list().unwrap(), ["log2"]);
+        assert_eq!(p1.read("log2").unwrap(), b"ab");
+        p1.truncate("log2", 1).unwrap();
+        assert_eq!(p1.read("log2").unwrap(), b"a");
+        assert_eq!(disk.list().unwrap(), ["other", "p1-log2"]);
+        let mut p1 = Prefixed {
+            inner: &mut disk,
+            prefix: "p1-".into(),
+        };
+        p1.remove("log2").unwrap();
+        assert_eq!(disk.list().unwrap(), ["other"]);
     }
 
     #[test]

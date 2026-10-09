@@ -265,11 +265,13 @@ fn sim_cluster_replays_a_seed_and_reports_a_planted_bug() {
         text.contains("append t") && text.contains("lease jobs") && text.contains("trace hash"),
         "{text}"
     );
-    let swept = sim(&["--seeds", "0..5", "--bug", "no-fence"]);
+    let swept = sim(&["--seeds", "0..5", "--bug", "no-dedup-key"]);
     assert_eq!(swept.status.code(), Some(1));
     let text = String::from_utf8(swept.stdout).unwrap();
     assert!(
-        text.contains("failed") && text.contains("replay: cargo run -- sim --cluster --seed"),
+        text.contains("failed")
+            && text.contains("replay: cargo run -- sim --cluster --seed")
+            && text.contains("--bug no-dedup-key"),
         "{text}"
     );
     assert_eq!(

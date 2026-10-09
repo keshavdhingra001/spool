@@ -1015,3 +1015,104 @@ durability, deduplication and effectively-once effects at every batch, every rec
   laptop (about 30 ms a seed; 1,156 s when sharing the CPU): 13,358,386 entries committed,
   640,573 completions, 164,517 elections, 48,806 leader crashes, 7,750 proposals replaced by
   another leader's entry and 247 `unknown` answers.
+
+### D74: A queue is spread over every partition; a partition is one Raft group
+- **What:** a cluster runs P partitions, fixed when it starts (1 to 256). Each partition is one
+  Raft group whose state machine is the M7 queue, and every queue lives in every partition. A
+  partition's queue holds the jobs routed to it (D76) and nothing else knows about them.
+- **Alternatives:** a partition count chosen per queue at `configure`; a whole queue in one
+  partition; ranges that split as they grow.
+- **Why:** a client must know where a job goes before it sends the enqueue. With a count per queue
+  that needs a catalog (another replicated table, read before every first enqueue to a queue),
+  and `configure` becomes a write across groups. With P fixed for the cluster, routing is a pure
+  function of the op and P, and each partition's state machine stays the queue we already check.
+  The cost: P cannot differ per queue or change while the cluster runs; that needs membership
+  changes (Tier 3).
+
+### D75: Every node runs one replica of every partition
+- **What:** each node hosts one replica of each of the P groups: P core threads (D30, D66) and one
+  connection per peer that carries the Raft messages of every group, each tagged with its
+  partition. Leaders of different partitions land on different nodes as elections fall.
+- **Alternatives:** a process per replica; placing each group on a subset of nodes.
+- **Why:** it reuses `Replica` unchanged. Placement over subsets only pays with more nodes than
+  replicas per group, which a three-node cluster does not have.
+
+### D76: Routing
+- **What:** an op goes to one partition, chosen by the client:
+  - `enqueue`: FNV-1a (64-bit) of the ordering key (D79) modulo P; without one, of the dedup key;
+    without either, the client's own rotation. The cluster client gives every enqueue a dedup
+    key (D72), so its enqueues always hash.
+  - `heartbeat`, `ack`, `nack`, `complete`, `result`: the partition in the job id (D77).
+  - `lease`: the client's rotation (D78).
+  - `configure`, `redrive`, `subscribe`: every partition, one at a time, each retried as in D72.
+  Protocol version 3 adds a request frame that names its partition, and tags `raft` frames with
+  theirs. A replica answers `not_leader` for its own partition, so the client keeps one leader
+  hint per partition.
+- **Alternatives:** round-robin for enqueues without an ordering key; any node forwarding to the
+  right group.
+- **Why:** routing by the dedup key keeps D35 working: a producer that retries with the same key
+  reaches the same partition and is deduplicated there. Round-robin would add a second job. The
+  hash is spelled out (FNV-1a), not `std::hash`, so it never changes between builds. Dedup keys
+  are now unique per partition: the same key with two different ordering keys can reach two
+  partitions and is not deduplicated across them. `configure` and the others are safe to repeat
+  but not atomic: for a moment two partitions may run different retry policies.
+
+### D77: The partition is in the job id
+- **What:** a job id is `partition << 48 | n`, where each partition counts n from 1 (D10). Fencing
+  tokens count per partition. The single-node server is partition 0, so its ids do not change.
+- **Alternatives:** a `(partition, id)` pair on the wire.
+- **Why:** `ack`, `heartbeat`, `nack`, `complete` and `result` name only a job, so the id must say
+  where it lives. Tokens are compared only between leases of the same job (D5, D43), and a job
+  never leaves its partition, so a per-partition counter keeps every guarantee D5 states; D5's
+  "across all jobs" now means across all jobs of a partition.
+
+### D78: Leasing across partitions
+- **What:** the cluster client's `lease` asks one partition at a time, starting after the
+  partition of its last lease, and returns the first job. It answers `empty` only after every
+  partition was empty in this round.
+- **Alternatives:** a node that fans the lease out to every partition; long polling.
+- **Why:** every op stays inside one partition, with no coordination across groups. Starting after
+  the last hit spreads a worker's leases over the partitions. An empty queue costs P round trips,
+  which a worker spends only when idle; M11 measures it.
+
+### D79: Ordering keys
+- **What:** an enqueue may carry an ordering key (1 to 128 visible ASCII characters, like D35).
+  Jobs with the same queue and ordering key are leased one at a time, in enqueue order: only the
+  oldest live job of a key can be leased. It stays first while it waits for a retry. It stops
+  blocking the key when it is acked, completed or dead-lettered. A redriven job rejoins its key at
+  the back. Jobs without a key are unaffected.
+- **Alternatives:** order per partition only (Kafka: one consumer per partition); no ordering.
+- **Why:** this is SQS FIFO's message groups: order where the producer asks for it, parallel work
+  everywhere else. Routing by the ordering key (D76) puts a key in one partition, so the rule is
+  local to one state machine. The cost is head-of-line blocking: a failing job holds back its key
+  until it succeeds or dies. Dead-lettering unblocks it; the order after a redrive is stated.
+
+### D80: Consumer groups
+- **What:** `subscribe <queue> <group>` declares a consumer group. Once a queue has groups, an
+  enqueue to it adds one job to each group's queue, named `<queue>:<group>`, in the same command,
+  and none to the queue itself. Each group's queue is an ordinary queue: its own retry policy,
+  leases, ordering keys and dead letters. The dedup key belongs to the enqueue: a repeat names the
+  first group's job. There is no unsubscribe yet.
+- **Alternatives:** static partition ownership (a worker owns partitions, Kafka-style); deferring
+  consumer groups.
+- **Why:** fan-out at enqueue keeps every group's work in the queue machinery we already check,
+  with no shared cursor to coordinate. One command means a producer never sees a job reach some
+  groups and not others. `:` is not allowed in queue names, so a group's queue can never collide
+  with a queue someone named.
+
+### D81: One Raft log per partition per node
+- **What:** a node's data directory holds `p<n>/`, one M7 Raft log for each partition.
+- **Alternatives:** one log shared by every partition on the node.
+- **Why:** the smallest change from M7. A shared log would share syncs between groups; M11 decides
+  whether that is worth it.
+
+### D82: How M8 is checked
+- **What:** the simulator's cluster world runs P partitions (1 to 3) on its nodes. Producers enqueue
+  some jobs with ordering keys and to a queue with consumer groups; every M5 and M7 check runs per
+  partition. A new check: for each ordering key, no two leases overlap and jobs are completed in
+  enqueue order, both judged from the applied events. The ledger (D19) checks the D79 rule on every
+  lease. Planted bugs: `wrong-partition` (a retried enqueue goes to another partition) and
+  `ignore-order-key` (a lease takes a job that is not first in its key).
+- **Alternatives:** test partitions only on TCP.
+- **Why:** the D53 end checks already catch a duplicated or lost job, which is what wrong routing
+  produces. Ordering is a new promise, so it gets its own check and a bug that breaks it.

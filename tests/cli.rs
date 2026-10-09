@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use spool::client::Client;
-use spool::{DedupKey, Millis, Payload, QueueName};
+use spool::{DedupKey, Millis, OrderKey, Payload, QueueName};
 
 /// Start `spool serve` on a free port and return it with its address.
 fn serve(dir: &Path) -> (Child, String) {
@@ -111,7 +111,7 @@ async fn a_three_process_cluster_survives_kill_9_of_its_leader() {
         let mut child = Command::new(env!("CARGO_BIN_EXE_spool"))
             .args(["serve", "--data", dir.to_str().unwrap(), "--id"])
             .arg(id.to_string())
-            .args(["--cluster", &spec])
+            .args(["--cluster", &spec, "--partitions", "2"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -145,9 +145,11 @@ async fn a_three_process_cluster_survives_kill_9_of_its_leader() {
     };
 
     let queue = QueueName::new("q").unwrap();
-    let client = Client::cluster(members.clone(), Duration::from_secs(10));
+    let client = Client::cluster(members.clone(), 2, Duration::from_secs(10));
+    // One ordering key: both jobs in one partition, leased in order (D79).
+    let order = || Some(OrderKey::new("user-1").unwrap());
     let a = client
-        .enqueue(&queue, Payload(b"a".to_vec()), Millis(0), None)
+        .enqueue_ordered(&queue, Payload(b"a".to_vec()), Millis(0), None, order())
         .await
         .unwrap();
     let old = tokio::time::timeout(Duration::from_secs(10), leader())
@@ -157,9 +159,10 @@ async fn a_three_process_cluster_survives_kill_9_of_its_leader() {
     killed.kill().unwrap();
     killed.wait().unwrap();
     let b = client
-        .enqueue(&queue, Payload(b"b".to_vec()), Millis(0), None)
+        .enqueue_ordered(&queue, Payload(b"b".to_vec()), Millis(0), None, order())
         .await
         .unwrap();
+    assert_eq!(a.job.partition(), b.job.partition());
     children.insert(old, start(old));
     for (job, payload) in [(a.job, &b"a"[..]), (b.job, b"b")] {
         let leased = client.lease(&queue, Millis(60_000)).await.unwrap().unwrap();

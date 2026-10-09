@@ -6,13 +6,16 @@
 //! therefore pipeline over one connection, which is what lets a worker
 //! heartbeat while its handler is still waiting on another call.
 //!
-//! [`Client::cluster`] talks to a replicated queue (M7): it keeps one
-//! connection to the replica it believes leads, follows `not_leader` hints,
-//! moves to the next replica when there is no hint or the connection breaks,
-//! and resends after `unknown` (D71, D72). Every enqueue without a key gets a
-//! fresh one, so a resent enqueue never adds a second job (D35, D72). An
-//! attempt that gets no answer within [`ATTEMPT`] counts as a broken
-//! connection: a leader cut off from its quorum never answers.
+//! [`Client::cluster`] talks to a replicated queue (M7) of one or more
+//! partitions (M8). It routes each op to its partition (D76, [`route`]),
+//! keeps one connection per replica, and per partition the replica it
+//! believes leads: it follows `not_leader` hints, moves to the next replica
+//! when there is no hint or the connection breaks, and resends after
+//! `unknown` (D71, D72). Every enqueue without a key gets a fresh one, so a
+//! resent enqueue never adds a second job and always hashes to the same
+//! partition (D35, D72, D76). An attempt that gets no answer within
+//! [`ATTEMPT`] counts as a broken connection: a leader cut off from its
+//! quorum never answers.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -27,7 +30,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::command::{Event, Op, RejectReason, ResultStatus};
 use crate::protocol::{self, Reply, Request};
-use crate::types::{DedupKey, JobId, Lease, Millis, Payload, QueueName, Token};
+use crate::route::{Route, route};
+use crate::types::{DedupKey, JobId, Lease, Millis, OrderKey, Payload, QueueName, Token};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -76,10 +80,10 @@ enum Mode {
     Cluster(Arc<Router>),
 }
 
-/// One connection's request queue.
+/// One connection's request queue: each op with its partition.
 #[derive(Clone)]
 struct Conn {
-    requests: mpsc::Sender<(Op, ReplyTx)>,
+    requests: mpsc::Sender<(u16, Op, ReplyTx)>,
 }
 
 /// The result of an enqueue.
@@ -107,20 +111,32 @@ impl Client {
     }
 
     /// A client of the replicated queue whose replicas are `members`, by
-    /// Raft id. It connects on the first request and retries as the module
-    /// says for up to `retry_for`; the last error is returned after that.
-    pub fn cluster(members: BTreeMap<u32, SocketAddr>, retry_for: Duration) -> Client {
+    /// Raft id, with `partitions` partitions (D74; the count every replica
+    /// was started with). It connects on first use and retries as the
+    /// module says for up to `retry_for`; the last error is returned after
+    /// that.
+    pub fn cluster(
+        members: BTreeMap<u32, SocketAddr>,
+        partitions: u16,
+        retry_for: Duration,
+    ) -> Client {
         assert!(!members.is_empty(), "a cluster has members");
-        let target = *members.keys().next().unwrap();
+        assert!(partitions > 0, "a cluster has partitions");
+        let first = *members.keys().next().unwrap();
+        let targets = (0..partitions)
+            .map(|_| Target {
+                node: first,
+                generation: 0,
+            })
+            .collect();
         Client {
             mode: Mode::Cluster(Arc::new(Router {
                 members,
+                partitions,
                 retry_for,
-                current: Mutex::new(Current {
-                    target,
-                    conn: None,
-                    generation: 0,
-                }),
+                targets: Mutex::new(targets),
+                conns: Mutex::new(BTreeMap::new()),
+                last_lease: AtomicU64::new(u64::from(partitions) - 1),
                 keys: key_prefix(),
                 next_key: AtomicU64::new(0),
             })),
@@ -149,7 +165,7 @@ impl Conn {
 
         let (mut rd, mut wr) = stream.into_split();
         let pending = Arc::new(Mutex::new(Pending::default()));
-        let (requests, mut rx) = mpsc::channel::<(Op, ReplyTx)>(256);
+        let (requests, mut rx) = mpsc::channel::<(u16, Op, ReplyTx)>(256);
 
         let writer_pending = pending.clone();
         tokio::spawn(async move {
@@ -159,7 +175,8 @@ impl Conn {
                 buf.clear();
                 let mut next = Some(first);
                 // Everything already queued goes out in one write.
-                while let Some((op, reply)) = next.take().or_else(|| rx.try_recv().ok()) {
+                while let Some((partition, op, reply)) = next.take().or_else(|| rx.try_recv().ok())
+                {
                     let id = next_id;
                     next_id += 1;
                     {
@@ -170,7 +187,13 @@ impl Conn {
                         }
                         p.waiting.push_back((id, reply));
                     }
-                    protocol::encode_request(id, &Request::Op(op), &mut buf);
+                    // Partition 0 as a plain request, which every version
+                    // speaks; others need version 3 (D76).
+                    let req = match partition {
+                        0 => Request::Op(op),
+                        partition => Request::Routed { partition, op },
+                    };
+                    protocol::encode_request(id, &req, &mut buf);
                 }
                 if protocol::write_all(&mut wr, &buf).await.is_err() {
                     return;
@@ -224,30 +247,36 @@ impl Conn {
         Ok(Conn { requests })
     }
 
-    async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
+    async fn request(&self, partition: u16, op: Op) -> Result<Vec<Event>, ClientError> {
         let (tx, rx) = oneshot::channel();
         self.requests
-            .send((op, tx))
+            .send((partition, op, tx))
             .await
             .map_err(|_| ClientError::Closed)?;
         rx.await.map_err(|_| ClientError::Closed)?
     }
 }
 
-/// The cluster client's view: which replica it sends to, over which
-/// connection. `generation` counts changes of target, so that of several
-/// callers that saw the same connection fail, only the first moves on.
+/// The cluster client's view: per partition, the replica it sends to; per
+/// replica, the connection, shared by every partition that targets it.
 struct Router {
     members: BTreeMap<u32, SocketAddr>,
+    partitions: u16,
     retry_for: Duration,
-    current: Mutex<Current>,
+    targets: Mutex<Vec<Target>>,
+    conns: Mutex<BTreeMap<u32, Conn>>,
+    /// The partition of the last lease that found a job (D78).
+    last_lease: AtomicU64,
     keys: String,
     next_key: AtomicU64,
 }
 
-struct Current {
-    target: u32,
-    conn: Option<Conn>,
+/// Where one partition's requests go. `generation` counts changes of
+/// target, so that of several callers that saw the same failure, only the
+/// first moves on.
+#[derive(Clone, Copy)]
+struct Target {
+    node: u32,
     generation: u64,
 }
 
@@ -287,77 +316,98 @@ impl Router {
         }
     }
 
-    /// The connection to the current target, dialed if there is none.
-    async fn conn(&self) -> Result<(u64, u32, Conn), (u64, ClientError)> {
-        let (generation, target) = {
-            let cur = self.current.lock().unwrap();
-            if let Some(conn) = &cur.conn {
-                return Ok((cur.generation, cur.target, conn.clone()));
-            }
-            (cur.generation, cur.target)
-        };
-        let conn = Conn::connect(self.members[&target])
-            .await
-            .map_err(|e| (generation, e))?;
-        let mut cur = self.current.lock().unwrap();
-        if cur.generation == generation && cur.conn.is_none() {
-            cur.conn = Some(conn.clone());
+    /// Partition `p`'s target and the connection to it, dialed if there is
+    /// none.
+    async fn conn(&self, p: u16) -> Result<(Target, Conn), (Target, ClientError)> {
+        let target = self.targets.lock().unwrap()[usize::from(p)];
+        if let Some(conn) = self.conns.lock().unwrap().get(&target.node) {
+            return Ok((target, conn.clone()));
         }
-        Ok((generation, target, conn))
+        let conn = Conn::connect(self.members[&target.node])
+            .await
+            .map_err(|e| (target, e))?;
+        // Another caller may have dialed it meanwhile; keep one of the two.
+        let conn = self
+            .conns
+            .lock()
+            .unwrap()
+            .entry(target.node)
+            .or_insert(conn)
+            .clone();
+        Ok((target, conn))
     }
 
-    /// Move on from the target of `generation`: to `leader` if it is a
-    /// member, else to the next replica.
-    fn retarget(&self, generation: u64, leader: Option<u32>) {
-        let mut cur = self.current.lock().unwrap();
-        if cur.generation != generation {
+    /// Forget a connection that failed, unless it was replaced already.
+    fn drop_conn(&self, node: u32, conn: &Conn) {
+        let mut conns = self.conns.lock().unwrap();
+        if conns
+            .get(&node)
+            .is_some_and(|c| c.requests.same_channel(&conn.requests))
+        {
+            conns.remove(&node);
+        }
+    }
+
+    /// Move partition `p` on from `seen`: to `leader` if it is a member,
+    /// else to the next replica.
+    fn retarget(&self, p: u16, seen: Target, leader: Option<u32>) {
+        let mut targets = self.targets.lock().unwrap();
+        let t = &mut targets[usize::from(p)];
+        if t.generation != seen.generation {
             return; // someone else moved on already
         }
-        cur.target = match leader.filter(|l| self.members.contains_key(l)) {
+        t.node = match leader.filter(|l| self.members.contains_key(l)) {
             Some(l) => l,
             None => self
                 .members
-                .range(cur.target + 1..)
+                .range(t.node + 1..)
                 .next()
                 .or_else(|| self.members.iter().next())
                 .map(|(&id, _)| id)
                 .unwrap(),
         };
-        cur.conn = None;
-        cur.generation += 1;
+        t.generation += 1;
     }
 
-    async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
-        let op = self.keyed(op);
-        let started = Instant::now();
+    /// Send `op` to partition `p`'s leader, following redirects and retrying
+    /// for up to `retry_for` from `started`.
+    async fn to_partition(
+        &self,
+        p: u16,
+        op: &Op,
+        started: Instant,
+    ) -> Result<Vec<Event>, ClientError> {
         let mut backoff = Duration::from_millis(10);
         loop {
-            let error = match self.conn().await {
-                Ok((generation, target, conn)) => match tokio::time::timeout(
+            let error = match self.conn(p).await {
+                Ok((target, conn)) => match tokio::time::timeout(
                     ATTEMPT.min(self.retry_for),
-                    conn.request(op.clone()),
+                    conn.request(p, op.clone()),
                 )
                 .await
                 .unwrap_or(Err(ClientError::Closed))
                 {
                     Ok(events) => return Ok(events),
-                    Err(ClientError::NotLeader(Some(l))) if l != target => {
+                    Err(ClientError::NotLeader(Some(l))) if l != target.node => {
                         // A named leader: go there now.
-                        self.retarget(generation, Some(l));
+                        self.retarget(p, target, Some(l));
                         continue;
                     }
-                    Err(
-                        e @ (ClientError::NotLeader(_) | ClientError::Closed | ClientError::Io(_)),
-                    ) => {
-                        self.retarget(generation, None);
+                    Err(ClientError::NotLeader(leader)) => {
+                        self.retarget(p, target, leader.filter(|&l| l != target.node));
+                        ClientError::NotLeader(leader)
+                    }
+                    Err(e @ (ClientError::Closed | ClientError::Io(_))) => {
+                        self.drop_conn(target.node, &conn);
+                        self.retarget(p, target, None);
                         e
                     }
                     // Same replica, after a pause: it may know more by then.
                     Err(ClientError::Unknown) => ClientError::Unknown,
                     Err(e) => return Err(e),
                 },
-                Err((generation, e)) => {
-                    self.retarget(generation, None);
+                Err((target, e)) => {
+                    self.retarget(p, target, None);
                     e
                 }
             };
@@ -368,6 +418,45 @@ impl Router {
             backoff = (backoff * 2).min(Duration::from_millis(500));
         }
     }
+
+    async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
+        let op = self.keyed(op);
+        let started = Instant::now();
+        match route(&op, self.partitions) {
+            Route::One(p) if p >= self.partitions => Err(ClientError::Protocol(format!(
+                "partition {p}, but the cluster has {}",
+                self.partitions
+            ))),
+            Route::One(p) => self.to_partition(p, &op, started).await,
+            // Each partition in turn, every event kept: the last event is
+            // the last partition's answer.
+            Route::All => {
+                let mut events = Vec::new();
+                for p in 0..self.partitions {
+                    events.extend(self.to_partition(p, &op, started).await?);
+                }
+                Ok(events)
+            }
+            // From the partition after the last one that had a job, until
+            // one has a job; `empty` only once every partition said so.
+            Route::Rotate => {
+                let n = u64::from(self.partitions);
+                let first = (self.last_lease.load(Ordering::Relaxed) + 1) % n;
+                let mut events = Vec::new();
+                for i in 0..n {
+                    let p = ((first + i) % n) as u16;
+                    events = self.to_partition(p, &op, started).await?;
+                    if !matches!(events.last(), Some(Event::Empty { .. })) {
+                        if matches!(op, Op::Lease { .. }) {
+                            self.last_lease.store(u64::from(p), Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                }
+                Ok(events)
+            }
+        }
+    }
 }
 
 impl Client {
@@ -376,7 +465,7 @@ impl Client {
     /// the module says.
     pub async fn request(&self, op: Op) -> Result<Vec<Event>, ClientError> {
         match &self.mode {
-            Mode::One(conn) => conn.request(op).await,
+            Mode::One(conn) => conn.request(0, op).await,
             Mode::Cluster(router) => router.request(op).await,
         }
     }
@@ -398,6 +487,20 @@ impl Client {
         delay: Millis,
         key: Option<DedupKey>,
     ) -> Result<Enqueued, ClientError> {
+        self.enqueue_ordered(queue, payload, delay, key, None).await
+    }
+
+    /// Enqueue with an ordering key: jobs of `queue` with the same `order`
+    /// are leased one at a time, in enqueue order (D79). With consumer
+    /// groups, the job of the first group is returned (D80).
+    pub async fn enqueue_ordered(
+        &self,
+        queue: &QueueName,
+        payload: Payload,
+        delay: Millis,
+        key: Option<DedupKey>,
+        order: Option<OrderKey>,
+    ) -> Result<Enqueued, ClientError> {
         // A cluster client keys every enqueue; only a caller's key can make
         // an enqueue a duplicate in the caller's eyes.
         let keyed = key.is_some();
@@ -406,17 +509,40 @@ impl Client {
             payload,
             delay,
             key,
-            order: None,
+            order,
         };
-        match self.outcome(op).await? {
-            Event::Enqueued { job, .. } => Ok(Enqueued {
+        // Expiry events of other jobs come first; then the op's own: one
+        // `enqueued` per consumer group (D80), or one other event.
+        let events = self.request(op).await?;
+        let first = events.iter().find(|e| {
+            matches!(
+                e,
+                Event::Enqueued { .. } | Event::Deduplicated { .. } | Event::Rejected { .. }
+            )
+        });
+        match first.cloned() {
+            Some(Event::Rejected { reason }) => Err(ClientError::Rejected(reason)),
+            Some(Event::Enqueued { job, .. }) => Ok(Enqueued {
                 job,
                 deduplicated: false,
             }),
-            Event::Deduplicated { job, .. } => Ok(Enqueued {
+            Some(Event::Deduplicated { job, .. }) => Ok(Enqueued {
                 job,
                 deduplicated: keyed,
             }),
+            Some(other) => Err(unexpected(other)),
+            None => Err(ClientError::Protocol("no events for the op".into())),
+        }
+    }
+
+    /// Give `queue` the consumer group `group` (D80), in every partition.
+    pub async fn subscribe(&self, queue: &QueueName, group: &QueueName) -> Result<(), ClientError> {
+        let op = Op::Subscribe {
+            queue: queue.clone(),
+            group: group.clone(),
+        };
+        match self.outcome(op).await? {
+            Event::Subscribed { .. } => Ok(()),
             other => Err(unexpected(other)),
         }
     }
@@ -522,7 +648,7 @@ mod tests {
     #[test]
     fn a_cluster_client_keys_every_unkeyed_enqueue_once() {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let c = Client::cluster(BTreeMap::from([(0, addr)]), Duration::from_secs(1));
+        let c = Client::cluster(BTreeMap::from([(0, addr)]), 1, Duration::from_secs(1));
         let Mode::Cluster(router) = &c.mode else {
             panic!("a cluster client");
         };
@@ -545,7 +671,7 @@ mod tests {
             DedupKey::new("mine").ok()
         );
         assert_eq!(router.keyed(Op::Tick), Op::Tick);
-        let other = Client::cluster(BTreeMap::from([(0, addr)]), Duration::from_secs(1));
+        let other = Client::cluster(BTreeMap::from([(0, addr)]), 1, Duration::from_secs(1));
         let Mode::Cluster(other) = &other.mode else {
             panic!()
         };

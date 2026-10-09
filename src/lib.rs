@@ -21,6 +21,7 @@ pub mod raft;
 pub mod reference;
 pub mod replica;
 pub mod retry;
+pub mod route;
 pub mod scenario;
 pub mod server;
 pub mod sim;

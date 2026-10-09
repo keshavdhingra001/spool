@@ -91,7 +91,8 @@ usage: spool                                   REPL, in memory
                                                serve as replica n of a cluster (M7) with p
                                                partitions (M8, default 1; the same on every node)
        spool connect <addr>                    REPL against a server
-       spool connect --cluster <id>=<addr>,... REPL against a cluster
+       spool connect --cluster <id>=<addr>,... [--partitions <p>]
+                                               REPL against a cluster
        spool sim --seed <n> [--trace] [--bug <bug>]     run one simulation seed
        spool sim --seeds <a>..<b> [--bug <bug>]         sweep seeds, stop at the first failure
                                                bugs to plant (D54): no-fence, no-dedup-key
@@ -401,7 +402,11 @@ fn serve_cluster(
 fn connect(target: &str) -> io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let client = match target.strip_prefix("cluster:") {
-        Some(spec) => Client::cluster(members(spec), Duration::from_secs(10)),
+        Some(spec) => {
+            let (spec, partitions) = spec.split_once(' ').unwrap_or((spec, "1"));
+            let partitions = partitions.parse().unwrap_or_else(|_| usage());
+            Client::cluster(members(spec), partitions, Duration::from_secs(10))
+        }
         None => match rt.block_on(Client::connect(target)) {
             Ok(c) => c,
             Err(e) => {
@@ -463,7 +468,10 @@ fn main() -> io::Result<()> {
             let id = id.parse().unwrap_or_else(|_| usage());
             return serve_cluster(Path::new(dir), id, members(spec), partitions(rest));
         }
-        ["connect", "--cluster", spec] => return connect(&format!("cluster:{spec}")),
+        ["connect", "--cluster", spec, rest @ ..] => {
+            let p = partitions(rest);
+            return connect(&format!("cluster:{spec} {p}"));
+        }
         ["connect", addr] => return connect(addr),
         ["sim", rest @ ..] => sim(rest),
         [] => {

@@ -1,6 +1,7 @@
-//! The replicated queue over real TCP (M7, D71–D73): three in-process
-//! replicas on loopback, each running both checkers after every applied
-//! command, driven by the cluster client and the worker library.
+//! The replicated queue over real TCP (M7, D71–D73; M8, D74–D80): three
+//! in-process replicas on loopback, of one or more partitions, each running
+//! both checkers after every applied command, driven by the cluster client
+//! and the worker library.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -10,7 +11,7 @@ use spool::client::{Client, ClientError};
 use spool::cluster::{ClusterOptions, ClusterServer};
 use spool::storage::MemStorage;
 use spool::worker::{Outcome, Worker, WorkerOptions};
-use spool::{Millis, Op, Payload, QueueName, ResultStatus};
+use spool::{Millis, Op, OrderKey, Payload, QueueName, ResultStatus};
 use tokio::net::TcpListener;
 
 fn q() -> QueueName {
@@ -19,11 +20,16 @@ fn q() -> QueueName {
 
 struct Cluster {
     members: BTreeMap<u32, SocketAddr>,
+    partitions: u16,
     servers: BTreeMap<u32, ClusterServer<MemStorage>>,
 }
 
 impl Cluster {
     async fn start() -> Cluster {
+        Self::with_partitions(1).await
+    }
+
+    async fn with_partitions(partitions: u16) -> Cluster {
         let mut listeners = BTreeMap::new();
         for id in 0..3 {
             listeners.insert(id, TcpListener::bind("127.0.0.1:0").await.unwrap());
@@ -34,10 +40,12 @@ impl Cluster {
             .collect();
         let mut c = Cluster {
             members,
+            partitions,
             servers: BTreeMap::new(),
         };
         for (id, listener) in listeners {
-            c.start_one(id, vec![MemStorage::new()], listener).await;
+            let storages = (0..partitions).map(|_| MemStorage::new()).collect();
+            c.start_one(id, storages, listener).await;
         }
         c
     }
@@ -54,7 +62,11 @@ impl Cluster {
     }
 
     fn client(&self) -> Client {
-        Client::cluster(self.members.clone(), Duration::from_secs(10))
+        Client::cluster(
+            self.members.clone(),
+            self.partitions,
+            Duration::from_secs(10),
+        )
     }
 
     /// The replica that leads, as the replicas themselves say.
@@ -212,7 +224,7 @@ async fn with_no_quorum_the_client_gives_up_after_its_retry_time() {
             c.stop(id).await;
         }
     }
-    let client = Client::cluster(c.members.clone(), Duration::from_millis(600));
+    let client = Client::cluster(c.members.clone(), 1, Duration::from_millis(600));
     let started = std::time::Instant::now();
     let err = client.request(Op::Tick).await;
     assert!(err.is_err(), "{err:?}");
@@ -278,5 +290,113 @@ async fn large_requests_are_split_into_entries_that_fit_a_peer_frame() {
     for id in [0, 1, 2] {
         let s = c.stop(id).await;
         let _ = s;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jobs_spread_over_partitions_and_each_is_served_by_its_own() {
+    let mut c = Cluster::with_partitions(3).await;
+    let client = c.client();
+    let mut jobs = Vec::new();
+    for i in 0..30u8 {
+        let e = client
+            .enqueue(&q(), Payload(vec![i]), Millis(0), None)
+            .await
+            .unwrap();
+        jobs.push(e.job);
+    }
+    // Automatic keys hash over every partition (D76), and each job id names
+    // the partition that took it (D77).
+    let mut per = [0; 3];
+    for job in &jobs {
+        per[usize::from(job.partition())] += 1;
+    }
+    assert!(per.iter().all(|&n| n > 0), "{per:?}");
+    // The worker's leases rotate over the partitions (D78) until all are done,
+    // and each ack and result goes to its job's partition.
+    work(&mut worker(c.client()), 30).await;
+    for (i, &job) in jobs.iter().enumerate() {
+        match client.result(job).await.unwrap() {
+            ResultStatus::Done { payload, .. } => assert_eq!(payload, Payload(vec![i as u8])),
+            other => panic!("job {job}: {other:?}"),
+        }
+    }
+    assert_eq!(client.lease(&q(), Millis(1_000)).await.unwrap(), None);
+    for id in [0, 1, 2] {
+        c.stop(id).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ordering_key_keeps_its_jobs_in_order_across_the_cluster() {
+    let mut c = Cluster::with_partitions(3).await;
+    let client = c.client();
+    let user = |n: u8| Some(OrderKey::new(&format!("user-{n}")).unwrap());
+    for i in 0..5u8 {
+        for n in 0..3u8 {
+            client
+                .enqueue_ordered(&q(), Payload(vec![n, i]), Millis(0), None, user(n))
+                .await
+                .unwrap();
+        }
+    }
+    // Leased one at a time per key: with every job of a key leased and not
+    // finished, that key offers nothing more, whatever the partition.
+    let mut held = Vec::new();
+    while let Some(job) = client.lease(&q(), Millis(30_000)).await.unwrap() {
+        held.push(job);
+    }
+    let mut firsts: Vec<_> = held.iter().map(|l| l.payload.0.clone()).collect();
+    firsts.sort();
+    assert_eq!(firsts, [vec![0, 0], vec![1, 0], vec![2, 0]]);
+    // Finishing each in turn releases the next of its key, in enqueue order.
+    let mut seen: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    while let Some(job) = held.pop() {
+        let (n, i) = (job.payload.0[0], job.payload.0[1]);
+        seen.entry(n).or_default().push(i);
+        client
+            .complete(job.lease.job, job.lease.token, Payload(vec![]))
+            .await
+            .unwrap();
+        while let Some(next) = client.lease(&q(), Millis(30_000)).await.unwrap() {
+            held.push(next);
+        }
+    }
+    for n in 0..3u8 {
+        assert_eq!(seen[&n], [0, 1, 2, 3, 4], "user-{n}");
+    }
+    for id in [0, 1, 2] {
+        c.stop(id).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_groups_get_every_job_in_every_partition() {
+    let mut c = Cluster::with_partitions(2).await;
+    let client = c.client();
+    let group = |g: &str| QueueName::new(g).unwrap();
+    client.subscribe(&q(), &group("audit")).await.unwrap();
+    client.subscribe(&q(), &group("send")).await.unwrap();
+    for i in 0..10u8 {
+        let e = client
+            .enqueue(&q(), Payload(vec![i]), Millis(0), None)
+            .await
+            .unwrap();
+        assert!(!e.deduplicated);
+    }
+    // The queue itself holds nothing; each group's queue holds every job.
+    assert_eq!(client.lease(&q(), Millis(1_000)).await.unwrap(), None);
+    for g in ["audit", "send"] {
+        let queue = q().group(&group(g)).unwrap();
+        let mut got = Vec::new();
+        while let Some(job) = client.lease(&queue, Millis(30_000)).await.unwrap() {
+            got.push(job.payload.0[0]);
+            client.ack(job.lease.job, job.lease.token).await.unwrap();
+        }
+        got.sort();
+        assert_eq!(got, (0..10).collect::<Vec<u8>>(), "{g}");
+    }
+    for id in [0, 1, 2] {
+        c.stop(id).await;
     }
 }

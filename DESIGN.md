@@ -1028,6 +1028,9 @@ durability, deduplication and effectively-once effects at every batch, every rec
   function of the op and P, and each partition's state machine stays the queue we already check.
   The cost: P cannot differ per queue or change while the cluster runs; that needs membership
   changes (Tier 3).
+- **As built:** `ClusterServer::start` takes one storage per partition, so the count is the
+  length of that list (1 to 256); `spool serve --partitions <p>` and the client are given the same
+  number. Nodes do not check that they agree: a Raft frame for a partition a node lacks is dropped.
 
 ### D75: Every node runs one replica of every partition
 - **What:** each node hosts one replica of each of the P groups: P core threads (D30, D66) and one
@@ -1036,6 +1039,10 @@ durability, deduplication and effectively-once effects at every batch, every rec
 - **Alternatives:** a process per replica; placing each group on a subset of nodes.
 - **Why:** it reuses `Replica` unchanged. Placement over subsets only pays with more nodes than
   replicas per group, which a three-node cluster does not have.
+- **As built:** peers speak protocol version 3 only, since `raft` frames carry their partition.
+  The library keeps a node's other partitions serving when one core thread stops; `spool serve`
+  exits instead, and recovers every partition when restarted. In the simulator a node halts as a
+  whole, since its partitions share one disk (D81).
 
 ### D76: Routing
 - **What:** an op goes to one partition, chosen by the client:
@@ -1056,6 +1063,11 @@ durability, deduplication and effectively-once effects at every batch, every rec
   are now unique per partition: the same key with two different ordering keys can reach two
   partitions and is not deduplicated across them. `configure` and the others are safe to repeat
   but not atomic: for a moment two partitions may run different retry policies.
+- **As built:** `route::route` is the one function the client and the simulator use. `tick`
+  goes to partition 0. Settings go to each partition in turn and stop at the first that still
+  fails after the retry time, so a failed `configure` may have reached some partitions; repeating
+  it is safe. The client keeps one connection per node, shared by every partition whose leader is
+  there, and one leader hint per partition.
 
 ### D77: The partition is in the job id
 - **What:** a job id is `partition << 48 | n`, where each partition counts n from 1 (D10). Fencing
@@ -1065,6 +1077,7 @@ durability, deduplication and effectively-once effects at every batch, every rec
   where it lives. Tokens are compared only between leases of the same job (D5, D43), and a job
   never leaves its partition, so a per-partition counter keeps every guarantee D5 states; D5's
   "across all jobs" now means across all jobs of a partition.
+- **As built:** ids print in decimal, so partition 1's first job is 281474976710657 (2^48 + 1).
 
 ### D78: Leasing across partitions
 - **What:** the cluster client's `lease` asks one partition at a time, starting after the
@@ -1099,12 +1112,24 @@ durability, deduplication and effectively-once effects at every batch, every rec
   with no shared cursor to coordinate. One command means a producer never sees a job reach some
   groups and not others. `:` is not allowed in queue names, so a group's queue can never collide
   with a queue someone named.
+- **As built:** `:` is allowed in a queue name once, as `<queue>:<group>`, and an enqueue straight
+  to such a queue is rejected `bad_group`. The random command tests found why it must be: an
+  enqueue to `a:g` and a fan-out of `a` with the one group `g` produce the same event, so the event
+  ledger (D19) could not tell which queue owned the dedup key. `subscribe` parses any two names
+  and the queue rejects a bad pair with `bad_group`, as `configure` does with `bad_config`.
+  Snapshots (D27) are version 4: the partition, the jobs' ordering keys, each key's list and the
+  groups are appended at the end, so every older snapshot is still a prefix of the newer form.
+  The lists are stored because a redrive puts a job at the back of its key, so their order is not
+  the ids' order.
 
 ### D81: One Raft log per partition per node
 - **What:** a node's data directory holds `p<n>/`, one M7 Raft log for each partition.
 - **Alternatives:** one log shared by every partition on the node.
 - **Why:** the smallest change from M7. A shared log would share syncs between groups; M11 decides
   whether that is worth it.
+- **As built:** the simulator keeps each partition's log on its node's one disk under names
+  starting `p<n>-` (`storage::Prefixed`), so a crash or a torn write hits all of a node's
+  partitions at once.
 
 ### D82: How M8 is checked
 - **What:** the simulator's cluster world runs P partitions (1 to 3) on its nodes. Producers enqueue
@@ -1116,3 +1141,29 @@ durability, deduplication and effectively-once effects at every batch, every rec
 - **Alternatives:** test partitions only on TCP.
 - **Why:** the D53 end checks already catch a duplicated or lost job, which is what wrong routing
   produces. Ordering is a new promise, so it gets its own check and a bug that breaks it.
+- **As built:** a node is one simulated process running a replica of every partition. Producers
+  take turns: plain jobs, jobs with one of two ordering keys, and jobs to a queue with two
+  consumer groups, whose setup (`subscribe`, `configure`) goes to every partition. Workers lease
+  from each queue and partition in turn. The end check replays every partition's log from n0 and
+  runs the D53 checks over all of them together, counting one job per consumer group for a
+  fanned-out key. The ordering check works on the replayed events alone: per key, one lease at a
+  time, completions in enqueue order, and every job of a key in one partition. `--no-checks`
+  turns off the replicas' own checkers.
+- **Planted bugs:** over seeds 0..1000: `wrong-partition` (with 3 partitions) fails 775, first at
+  seed 0 (a key gets a second job in another partition); `ignore-order-key` fails 372, first at
+  seed 5, the same seeds with or without the replicas' checkers: with them the ledger refuses the
+  lease, without them the world's ordering check does. The M7 bugs still fail: `reply-before-commit`
+  34, `ignore-term-on-reply` 6, `no-fence` 171, `no-dedup-key` 879.
+- **Mutation pass:** 23 mutants of the queue's ordering and fan-out, the ids, the snapshot, the
+  ledger, the routing, the client, the server's partition handling, the replica, the prefixed
+  storage and the simulator's checks (`target/tmp/mut8.py`). The first pass killed 20; one did not
+  compile and was rewritten. Two survived and were killed by new tests: the checker accepting a
+  job id of another partition (a corruption test now plants one), and an ordered enqueue routed
+  like an unkeyed one. The second was a real gap: the route test compared two equal "rotate"
+  answers, and the ordering check worked per partition, so a key split over partitions was
+  invisible. The route test now checks the hashed partition, and the ordering check fails a key
+  seen in two partitions.
+- **Sweep:** seeds 0..20,000 pass in release mode in 759 s on this laptop (about 38 ms a seed),
+  with 1 to 3 partitions: 14,733,604 entries committed, 1,278,421 completions, 300,000 of them
+  of ordered jobs, 273,826 elections and 48,957 leader crashes; and again, with the ordering
+  check's partition rule added after the mutation pass, in 806 s.
